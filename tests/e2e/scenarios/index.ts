@@ -5,6 +5,9 @@ import kodyRulesCreateAndApply from "./kody-rules.js";
 import licenseAttribution from "./license-attribution.js";
 import onboardingWebhookRegistration from "./onboarding-webhook-registration.js";
 import perSeatLicenseToggle from "./per-seat-license-toggle.js";
+import rbacAuthorization from "./rbac-authorization.js";
+import rbacFrontendRoutes from "./rbac-frontend-routes.js";
+import rbacUiRender from "./rbac-ui-render.js";
 import ssoCookieDomain from "./sso-cookie-domain.js";
 import ssoMultiUser from "./sso-multi-user.js";
 import stripeBilling from "./stripe-billing.js";
@@ -17,6 +20,9 @@ export const allScenarios: Record<string, Scenario> = {
     [kodyRulesCreateAndApply.id]: kodyRulesCreateAndApply,
     [licenseAttribution.id]: licenseAttribution,
     [perSeatLicenseToggle.id]: perSeatLicenseToggle,
+    [rbacAuthorization.id]: rbacAuthorization,
+    [rbacFrontendRoutes.id]: rbacFrontendRoutes,
+    [rbacUiRender.id]: rbacUiRender,
     [ssoCookieDomain.id]: ssoCookieDomain,
     [ssoMultiUser.id]: ssoMultiUser,
     [stripeBilling.id]: stripeBilling,
@@ -42,6 +48,9 @@ export {
     licenseAttribution,
     onboardingWebhookRegistration,
     perSeatLicenseToggle,
+    rbacAuthorization,
+    rbacFrontendRoutes,
+    rbacUiRender,
     ssoCookieDomain,
     ssoMultiUser,
     stripeBilling,

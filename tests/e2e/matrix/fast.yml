@@ -29,6 +29,14 @@ scenarios:
     # (one cell). Skipped automatically when SH_LICENSE_KEY_PATH (default
     # ~/.kodus-dev/license-seats1.jwt) isn't available — see run-matrix.ts.
     - per-seat-license-toggle
+    # RBAC authorization matrix: signs up its own throwaway org, provisions one
+    # user per role, and asserts the expected 200/403 across API endpoints.
+    # appliesTo restricts it to github × paid (one cell per target).
+    - rbac-authorization
+    # RBAC frontend route guard: per role, signs in over HTTP (next-auth) and
+    # asserts the Next middleware redirects to /forbidden per the route
+    # manifest — the layer the #1229 bug lived in. HTTP-only, so fast.
+    - rbac-frontend-routes
 
 cells:
     # ---------- self-hosted ----------

@@ -51,7 +51,20 @@ function appliesToCell(scenario: Scenario, cell: MatrixCell): boolean {
     return true;
 }
 
-function envForTarget(target: Target): TargetContext {
+// Per-provider env-var suffix: uppercase, non-alnum → `_`.
+// github → GITHUB, azure-devops → AZURE_DEVOPS, github-app → GITHUB_APP.
+// Used so each self-hosted provider can point at its OWN droplet via
+// SELFHOSTED_API_BASE_URL_<SUFFIX> (set by --auto-provision-per-provider),
+// enabling the per-provider parallel matrix. Falls back to the shared
+// SELFHOSTED_* vars for the single-droplet (serial) path.
+export function selfhostedEnvSuffix(provider: ProviderName): string {
+    return provider.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+}
+
+function envForTarget(
+    target: Target,
+    provider?: ProviderName,
+): TargetContext {
     if (target === "cloud") {
         // QA cloud routes API traffic through the web app's reverse proxy
         // at `/api/proxy/api/*` — the standalone `api-qa.kodus.io` host is
@@ -73,26 +86,36 @@ function envForTarget(target: Target): TargetContext {
             `${webBaseUrl.replace(/\/$/, "")}/api/proxy/api`;
         return { target, apiBaseUrl, webBaseUrl };
     }
-    // Self-hosted prefers the target-scoped envs (SELFHOSTED_*) that
-    // auto-provision exports, falling back to the legacy generic
-    // TARGET_* envs for users running outside auto-provision.
+    // Self-hosted resolution order, most specific first:
+    //   1. SELFHOSTED_*_<PROVIDER>  — set by --auto-provision-per-provider,
+    //      one droplet per provider (enables parallel isolated runs)
+    //   2. SELFHOSTED_*             — shared single-droplet auto-provision
+    //   3. TARGET_*                 — legacy generic envs (manual runs)
+    const sfx = provider ? selfhostedEnvSuffix(provider) : undefined;
+    const perProvider = (base: string): string | undefined =>
+        sfx ? process.env[`${base}_${sfx}`] : undefined;
+
     const apiBaseUrl =
+        perProvider("SELFHOSTED_API_BASE_URL") ??
         process.env.SELFHOSTED_API_BASE_URL ??
         process.env.TARGET_BASE_URL ??
         (() => {
             throw new Error(
-                "SELFHOSTED_API_BASE_URL (preferred) or TARGET_BASE_URL is required for self-hosted target (e.g. http://1.2.3.4:3001)",
+                `SELFHOSTED_API_BASE_URL_${sfx ?? "<PROVIDER>"} or SELFHOSTED_API_BASE_URL or TARGET_BASE_URL is required for self-hosted target (e.g. http://1.2.3.4:3001)`,
             );
         })();
     const webBaseUrl =
+        perProvider("SELFHOSTED_WEB_URL") ??
         process.env.SELFHOSTED_WEB_URL ??
         process.env.TARGET_WEB_URL ??
         apiBaseUrl.replace(/:3001$/, ":3000");
     const tunnelUrl =
-        process.env.SELFHOSTED_TUNNEL_URL ?? process.env.TARGET_TUNNEL_URL;
+        perProvider("SELFHOSTED_TUNNEL_URL") ??
+        process.env.SELFHOSTED_TUNNEL_URL ??
+        process.env.TARGET_TUNNEL_URL;
     if (!tunnelUrl) {
         throw new Error(
-            "SELFHOSTED_TUNNEL_URL (preferred) or TARGET_TUNNEL_URL is required for self-hosted target (e.g. https://xxx.trycloudflare.com)",
+            `SELFHOSTED_TUNNEL_URL_${sfx ?? "<PROVIDER>"} or SELFHOSTED_TUNNEL_URL or TARGET_TUNNEL_URL is required for self-hosted target (e.g. https://xxx.trycloudflare.com)`,
         );
     }
     return { target, apiBaseUrl, webBaseUrl, tunnelUrl };
@@ -131,6 +154,11 @@ interface CloudTenantEntry {
     provider: ProviderName;
     organizationId?: string;
     teamId?: string;
+    // Per-tenant fixture repo persisted by setup-tenants. Drives the
+    // provider's repo for this cell so each cloud GitHub tenant runs on
+    // its own repo (1 org : 1 repo). Absent for providers that don't
+    // need isolation → falls back to the env-resolved per-target repo.
+    repoFullName?: string;
 }
 
 function readCloudTenantsFile(): CloudTenantEntry[] {
@@ -160,7 +188,12 @@ async function resolveTenantForCell(
         const match = entries.find(
             (e) => e.provider === provider && e.license === license,
         );
-        if (match) return { email: match.email, password: match.password };
+        if (match)
+            return {
+                email: match.email,
+                password: match.password,
+                repoFullName: match.repoFullName,
+            };
 
         // Legacy fallback: per-license env vars (CLOUD_TENANT_PAID_EMAIL
         // etc.). Kept so a one-off run can drive a hand-seeded tenant
@@ -234,33 +267,60 @@ export async function runMatrix(opts: RunOptions): Promise<RunOutcome> {
     // or webhook bursts on auto-closed orphans across all providers.
     // Cleaning up here makes every run start from a known-clean
     // state regardless of how the previous one ended. Deduped on
-    // provider so 4 cells × 1 provider only hit the upstream API
-    // once. `opts.dryRun` short-circuits (no upstream calls).
+    // (provider, repo): cloud GitHub tenants each own a SEPARATE repo
+    // (1 org : 1 repo), so a stale [e2e] PR can hide on a sibling
+    // tenant's repo and 409 its next run — visit every distinct repo,
+    // not just every provider. `opts.dryRun` short-circuits.
     if (!opts.dryRun) {
-        const uniqueProviders = Array.from(
-            new Set(
-                opts.cells
-                    .filter((c) => c.target === opts.target)
-                    .map((c) => c.provider),
-            ),
-        );
-        for (const providerName of uniqueProviders) {
+        // Index the cloud tenants by (provider, license) once so the
+        // per-cell repo lookup below is an O(1) Map.get instead of a
+        // .find() scan inside the loop.
+        const repoByProviderLicense = new Map<string, string | undefined>();
+        if (opts.target === "cloud") {
+            for (const e of readCloudTenantsFile()) {
+                repoByProviderLicense.set(
+                    `${e.provider}::${e.license}`,
+                    e.repoFullName,
+                );
+            }
+        }
+        const fixtures = new Map<
+            string,
+            { provider: ProviderName; repo?: string }
+        >();
+        for (const c of opts.cells) {
+            if (c.target !== opts.target) continue;
+            const repo =
+                opts.target === "cloud"
+                    ? repoByProviderLicense.get(`${c.provider}::${c.license}`)
+                    : undefined;
+            fixtures.set(`${c.provider}::${repo ?? "default"}`, {
+                provider: c.provider,
+                repo,
+            });
+        }
+        for (const { provider: providerName, repo } of fixtures.values()) {
+            const label = `${providerName}${repo ? ` (${repo})` : ""}`;
             try {
-                const provider = makeProvider(providerName);
+                const provider = makeProvider(
+                    providerName,
+                    opts.target,
+                    repo,
+                );
                 const { closed } = await provider.cleanupStaleE2EArtifacts();
                 if (closed > 0) {
                     log.info(
-                        `[cleanup] ${providerName}: abandoned ${closed} stale [e2e]-prefixed PR(s) from prior runs`,
+                        `[cleanup] ${label}: abandoned ${closed} stale [e2e]-prefixed PR(s) from prior runs`,
                     );
                 }
             } catch (err) {
                 // Best-effort. Don't poison the entire matrix run just
-                // because cleanup couldn't list PRs on one provider —
+                // because cleanup couldn't list PRs on one fixture —
                 // the per-scenario open path still throws its own
                 // specific error if a stale PR ends up blocking it,
                 // and that error is what the operator sees.
                 log.info(
-                    `[cleanup] ${providerName}: skipped (${err instanceof Error ? err.message : String(err)})`,
+                    `[cleanup] ${label}: skipped (${err instanceof Error ? err.message : String(err)})`,
                 );
             }
         }
@@ -276,7 +336,7 @@ export async function runMatrix(opts: RunOptions): Promise<RunOutcome> {
                   webBaseUrl: "https://dry-run.invalid",
                   tunnelUrl: "https://dry-run.invalid",
               }
-            : envForTarget(cell.target);
+            : envForTarget(cell.target, cell.provider);
         const tenant = opts.dryRun
             ? { email: "dry-run@kodus.test", password: "dry-run" }
             : await resolveTenantForCell(
@@ -310,7 +370,11 @@ export async function runMatrix(opts: RunOptions): Promise<RunOutcome> {
             log.info(`RUN   ${cellLabel}`);
             const t0 = Date.now();
             try {
-                const provider = makeProvider(cell.provider);
+                const provider = makeProvider(
+                    cell.provider,
+                    cell.target,
+                    tenant?.repoFullName,
+                );
                 const scenarioArtifactDir = join(
                     artifactDir,
                     `${scenario.id}-${cell.target}-${cell.provider}-${cell.license}`,
@@ -326,8 +390,8 @@ export async function runMatrix(opts: RunOptions): Promise<RunOutcome> {
                         login: (creds) => login(target, creds),
                         registerIntegration: (session) =>
                             registerIntegration(target, provider, session),
-                        registerRepo: (session) =>
-                            registerRepo(target, provider, session),
+                        registerRepo: (session, repoOpts) =>
+                            registerRepo(target, provider, session, repoOpts),
                         finishOnboarding: (session, repo) =>
                             finishOnboarding(target, session, repo),
                     },

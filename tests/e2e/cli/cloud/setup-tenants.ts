@@ -65,45 +65,52 @@ interface TenantSpec {
     name: string;
     license: TenantLicense;
     provider: ProviderName;
-    repoFullName: string;
+    // Dedicated cloud fixture repo for this tenant. REQUIRED for GitHub
+    // PAT tenants and honoured only there (makeProvider forwards it to
+    // the GitHub provider via repoOverride; the other providers resolve
+    // their cloud repo from env). Optional for the rest.
+    repoFullName?: string;
 }
 
 // Tenant registry. Names can only contain letters / spaces / hyphens /
 // apostrophes (Kodus validates `^[A-Za-z\s\-']+$` server-side), so no
 // digits in the visible name.
 //
-// Repos are shared across tiers of the same provider — license tier is
-// per-org on cloud (Stripe-driven), so each tier needs its own
-// organization, but webhooks from a single repo can be disambiguated
-// by Kodus per integration (App installation id for GitHub, OAuth/PAT
-// integration uuid for GitLab/Bitbucket/Azure). One downside: the
-// `generateKodyRulesUseCase` step at finish-onboarding reads the
-// repo's PR history regardless of which org is onboarding, so the
-// rules generated for tier B can be shaped by traffic from tier A —
-// acceptable for the QA matrix where the license-attribution and
-// per-seat gates are the real signal; revisit if a scenario needs
-// strictly isolated rule histories.
+// GitHub PAT tenants get ONE REPO EACH (1 org : 1 repo). License tier is
+// per-org on cloud (Stripe-driven), so every tier is a distinct Kodus
+// org. The PAT webhook is a bare `/github/webhook` with no per-org
+// discriminator, and the backend resolves repo→org by picking the first
+// IntegrationConfig ordered by updatedAt DESC (webhook-context.service
+// .getContext / save.use-case). So if several orgs share one repo, a
+// PR's review fires for whichever org most recently touched its repo
+// config — NOT reliably the org under test — and the scenario times out
+// waiting for a review that landed on someone else (or got silently
+// dropped). Giving each tenant its own repo removes the ambiguity
+// entirely, matching what GitLab/Bitbucket/Azure already get for free
+// (one org per repo on cloud). github-app is already isolated on its
+// App-bound repo. Provision the repos with scripts/e2e/provision-cloud-
+// github-repos.sh before the first seed.
 const TENANTS: TenantSpec[] = [
     {
         email: "e2e-paid-gh@kodus.io",
         name: "Smoke Paid GitHub",
         license: "paid",
         provider: "github",
-        repoFullName: "kodus-e2e/tiny-url",
+        repoFullName: "kodus-e2e/tiny-url-cloud-paid",
     },
     {
         email: "e2e-free-gh@kodus.io",
         name: "Smoke Free GitHub",
         license: "free",
         provider: "github",
-        repoFullName: "kodus-e2e/tiny-url",
+        repoFullName: "kodus-e2e/tiny-url-cloud-free",
     },
     {
         email: "e2e-trial-gh@kodus.io",
         name: "Smoke Trial GitHub",
         license: "trial",
         provider: "github",
-        repoFullName: "kodus-e2e/tiny-url",
+        repoFullName: "kodus-e2e/tiny-url-cloud-trial",
     },
     {
         email: "e2e-paid-gl@kodus.io",
@@ -134,7 +141,7 @@ const TENANTS: TenantSpec[] = [
         name: "Smoke Community BYOK GitHub",
         license: "community-byok",
         provider: "github",
-        repoFullName: "kodus-e2e/tiny-url",
+        repoFullName: "kodus-e2e/tiny-url-cloud-community",
     },
     {
         // Stripe billing scenario — sub-flow #1 (free → paid via
@@ -149,7 +156,7 @@ const TENANTS: TenantSpec[] = [
         name: "Stripe Checkout Free GitHub",
         license: "free",
         provider: "github",
-        repoFullName: "kodus-e2e/tiny-url",
+        repoFullName: "kodus-e2e/tiny-url-cloud-stripe-free",
     },
     {
         // Stripe billing scenario — sub-flow #2 (trial → paid via
@@ -161,7 +168,7 @@ const TENANTS: TenantSpec[] = [
         name: "Stripe Checkout Trial GitHub",
         license: "trial",
         provider: "github",
-        repoFullName: "kodus-e2e/tiny-url",
+        repoFullName: "kodus-e2e/tiny-url-cloud-stripe-trial",
     },
     {
         // GitHub App (OAuth installation) variant. Needs a DEDICATED
@@ -183,6 +190,38 @@ const TENANTS: TenantSpec[] = [
         repoFullName: "kodus-e2e/tiny-url-app",
     },
 ];
+
+// Fail-fast invariant: every GitHub PAT tenant MUST have its own repo,
+// and no two may share one. This is the whole point of the 1 org : 1
+// repo fix — a regression here (a new github tenant pointed at a sibling's
+// repo, or left without `repoFullName`) silently reintroduces the
+// webhook fan-out collision. Catch it at load time, loudly, instead of
+// as a flaky "review never started" three matrix runs later.
+function validateGithubRepoIsolation(tenants: TenantSpec[]): void {
+    const seen = new Map<string, string>();
+    const problems: string[] = [];
+    for (const t of tenants) {
+        if (t.provider !== "github") continue; // github-app + others are already isolated
+        if (!t.repoFullName) {
+            problems.push(`${t.email}: github tenant has no dedicated repoFullName`);
+            continue;
+        }
+        const prior = seen.get(t.repoFullName);
+        if (prior) {
+            problems.push(
+                `${t.repoFullName} is shared by ${prior} and ${t.email} — github tenants must not share a repo`,
+            );
+        } else {
+            seen.set(t.repoFullName, t.email);
+        }
+    }
+    if (problems.length) {
+        throw new Error(
+            `[cloud-setup] github repo-isolation invariant violated:\n  - ${problems.join("\n  - ")}`,
+        );
+    }
+}
+validateGithubRepoIsolation(TENANTS);
 
 interface SavedTenant extends TenantSpec {
     password: string;
@@ -246,20 +285,32 @@ function targetForCloud(): TargetContext {
 //                          (`/organization-parameters/create-or-update`
 //                          with key=byok_config). Gate allows reviews
 //                          using the org's own LLM key; 10-rule limit.
-//   - `trial` / `paid`  → activate the trial billing record via
-//                          `POST /api/proxy/billing/trial`. Real
-//                          paid would need Stripe Checkout but for
-//                          the matrix's gate-allows assertion trial
-//                          is sufficient. TODO: hook up the Stripe
-//                          flow when we need to differentiate paid-
-//                          specific limits.
+//   - `trial`           → activate the trial billing record via
+//                          `POST /api/proxy/billing/trial` (byok:false).
+//                          Status=trial, valid while the 14-day window is
+//                          open; exercises the trial-period gate.
+//   - `paid`            → exercised as BYOK (we deliberately do NOT test
+//                          the platform-managed LLM path). Same three-step
+//                          dance as community-byok → ends ACTIVE/free_byok,
+//                          which never expires. The real Stripe checkout
+//                          (free→paid ACTIVE via Stripe) lives in the
+//                          dedicated stripe-checkout scenario, not here.
 async function ensureLicenseTier(
     target: TargetContext,
     session: KodusSession,
     tenant: TenantSpec,
 ): Promise<boolean> {
     if (tenant.license === "free") return true;
-    if (tenant.license === "community-byok") {
+    // `paid` is exercised as a BYOK tenant (decision: we don't test the
+    // platform-managed LLM path). It takes the SAME three-step BYOK dance
+    // as community-byok, which is what makes it robust in CI: the final
+    // /migrate-to-free flips the row to planType=free_byok AND
+    // subscriptionStatus=ACTIVE — so it NEVER expires. The old `paid`
+    // path (/billing/trial byok:false) created a 14-day TRIAL row that
+    // createTrialLicense refuses to renew (throws "já existe"), so a
+    // once-seeded tenant silently rotted to validate-org-license:false
+    // ~14 days later. ACTIVE/free_byok has no such clock.
+    if (tenant.license === "community-byok" || tenant.license === "paid") {
         // The cloud gate (libs/ee/shared/services/permissionValidation
         // .service.ts) requires `validation.valid===true` AND
         // `planType` containing "byok" AND a stored BYOK config. The
@@ -268,6 +319,7 @@ async function ensureLicenseTier(
         //   1. POST /billing/trial         → creates the license row
         //   2. configure BYOK in org params
         //   3. POST /billing/migrate-to-free → flips planType to free_byok
+        //      (and subscriptionStatus to ACTIVE → no trial expiry)
         // /migrate-to-free fails with "Licença não encontrada" if step 1
         // didn't run first — the endpoint mutates an existing row.
         const trial = await http(
@@ -294,7 +346,7 @@ async function ensureLicenseTier(
                 ));
         if (!trialOk) {
             console.log(
-                `  [warn] community-byok: trial step returned HTTP ${trial.status}: ${trial.raw.slice(0, 200)}`,
+                `  [warn] ${tenant.license}: trial step returned HTTP ${trial.status}: ${trial.raw.slice(0, 200)}`,
             );
             return false;
         }
@@ -325,7 +377,7 @@ async function ensureLicenseTier(
             return true;
         }
         console.log(
-            `  [warn] community-byok: migrate-to-free returned HTTP ${migrate.status}: ${migrate.raw.slice(0, 200)}`,
+            `  [warn] ${tenant.license}: migrate-to-free returned HTTP ${migrate.status}: ${migrate.raw.slice(0, 200)}`,
         );
         return false;
     }
@@ -387,7 +439,7 @@ async function configureByok(
     const provider = process.env.API_LLM_PROVIDER ?? "openai";
     const baseURL =
         process.env.API_OPENAI_FORCE_BASE_URL ?? "https://api.openai.com/v1";
-    const model = process.env.API_LLM_PROVIDER_MODEL ?? "kimi-k2.6";
+    const model = process.env.API_LLM_PROVIDER_MODEL ?? "gpt-5.4-mini";
 
     const resp = await http(
         `${target.apiBaseUrl}/organization-parameters/create-or-update`,
@@ -422,16 +474,23 @@ async function connectProvider(
     repoRegistered: boolean;
     onboardingFinished: boolean;
 }> {
-    // Provider PATs + repo addressing come from the same env vars the
-    // self-hosted matrix uses (GH_TEST_TOKEN / GH_TEST_REPO / GL_*,
-    // BB_*, AZ_TEST_ORG/PROJECT/REPO). All cloud tenants point at the
-    // same fixture repos as self-hosted — there's nothing per-tenant
-    // to override here. The earlier attempt to overwrite e.g.
-    // `AZ_TEST_REPO` with the full `<org>/<project>/<repo>` path broke
-    // the Azure provider because it composes the URL from the three
-    // separate env pieces and the merged string isn't a valid repo
-    // name. Leave env alone.
-    const provider = makeProvider(tenant.provider);
+    // Provider PATs come from the same env vars the self-hosted matrix
+    // uses (GH_TEST_TOKEN / GL_*, BB_*, AZ_TEST_ORG/PROJECT/REPO).
+    //
+    // Repo addressing: GitHub PAT tenants pin their OWN repo via
+    // `tenant.repoFullName` (1 org : 1 repo — see the registry comment),
+    // forwarded as makeProvider's repoOverride. The other providers
+    // ignore the override and resolve their cloud repo from env
+    // (GL_TEST_REPO_CLOUD etc.) — they're already 1 org : 1 repo on
+    // cloud. NB: an earlier attempt to overwrite `AZ_TEST_REPO` with the
+    // full `<org>/<project>/<repo>` path broke Azure (it composes the URL
+    // from three separate env pieces), which is exactly why the override
+    // is scoped to GitHub only and the others keep reading env.
+    const provider = makeProvider(
+        tenant.provider,
+        "cloud",
+        tenant.repoFullName,
+    );
     await registerIntegration(target, provider, session);
     // Wait for /code-management/auth-integration's async post-processing
     // to land before /repositories queries depend on it. The UI flow
