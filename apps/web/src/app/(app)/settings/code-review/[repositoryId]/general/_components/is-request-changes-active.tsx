@@ -4,34 +4,22 @@ import { Button } from "@components/ui/button";
 import { CardHeader } from "@components/ui/card";
 import { Heading } from "@components/ui/heading";
 import { Switch } from "@components/ui/switch";
-import { useSuspenseGetConnections } from "@services/setup/hooks";
 import { Controller, useFormContext } from "react-hook-form";
 import { OverrideIndicatorForm } from "src/app/(app)/settings/code-review/_components/override";
-import { useSelectedTeamId } from "src/core/providers/selected-team-context";
-import { PlatformType } from "src/core/types";
-import { safeArray } from "src/core/utils/safe-array";
+import { useShouldHideRequestChanges } from "src/app/(app)/settings/_components/use-code-management-platform";
 
 import type { CodeReviewFormType } from "../../../_types";
 
-const hasGitLabConnection = (
-    connections: ReturnType<typeof useSuspenseGetConnections>,
-): boolean => {
-    return safeArray(connections)
-        .filter((c) => c.category === "CODE_MANAGEMENT" && c.hasConnection)
-        .some((connection) => connection.platformName === PlatformType.GITLAB);
-};
-
 export const IsRequestChangesActive = () => {
     const form = useFormContext<CodeReviewFormType>();
-    const { teamId } = useSelectedTeamId();
-    const connections = useSuspenseGetConnections(teamId);
-    const isCodeManagementGitlab = hasGitLabConnection(connections);
+    const shouldHide = useShouldHideRequestChanges();
+
+    if (shouldHide) return null;
 
     return (
         <div className="flex flex-col gap-2">
             <Controller
                 name="isRequestChangesActive.value"
-                disabled={isCodeManagementGitlab}
                 control={form.control}
                 render={({ field }) => (
                     <Button
@@ -64,10 +52,6 @@ export const IsRequestChangesActive = () => {
                     </Button>
                 )}
             />
-
-            <p className="text-text-secondary text-xs">
-                Note: This option is not applicable to Gitlab.
-            </p>
         </div>
     );
 };

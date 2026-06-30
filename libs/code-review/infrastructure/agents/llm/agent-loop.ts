@@ -5,6 +5,8 @@ import {
     type DocumentationSearchAdapter,
 } from './agent-tools.factory';
 import { attachClassification, classifyLLMError } from './error-classifier';
+import { AgentPromptTooLargeError } from './errors';
+import type { ReviewWarning } from './review-warnings';
 /**
  * Simple agent loop using Vercel AI SDK with native function calling.
  *
@@ -228,6 +230,7 @@ function buildOpenRouterRouting(input?: {
  */
 const PROVIDER_OPTIONS_NAMESPACE: Partial<Record<string, string>> = {
     [BYOKProvider.ANTHROPIC]: 'anthropic',
+    [BYOKProvider.ANTHROPIC_COMPATIBLE]: 'anthropic',
     [BYOKProvider.GOOGLE_GEMINI]: 'google',
     [BYOKProvider.GOOGLE_VERTEX]: 'google',
     [BYOKProvider.OPENAI]: 'openai',
@@ -437,6 +440,20 @@ export function buildReasoningProviderOptions(
             };
         }
 
+        case BYOKProvider.ANTHROPIC_COMPATIBLE:
+            // Anthropic-protocol endpoints from other vendors (Kimi Code,
+            // Z.ai, DeepSeek). They speak the classic thinking shape
+            // (enabled + budget_tokens); none of them implement Anthropic's
+            // newer adaptive thinking, so always use the budget form.
+            return {
+                anthropic: {
+                    thinking: {
+                        type: 'enabled',
+                        budgetTokens: EFFORT_TO_BUDGET[effort],
+                    },
+                },
+            };
+
         default:
             return {};
     }
@@ -456,9 +473,7 @@ import {
     buildCoverageLedger,
     CoverageSummary,
     CoverageTier,
-    formatCoverageDebt,
     getCoverageSummary,
-    isCoverageSatisfied,
     markCoverageFromToolCall,
     TIERED_TOTAL_COVERAGE_THRESHOLD,
 } from './coverage-ledger';
@@ -548,6 +563,59 @@ function computeStepBudgetNote(
     }
     return { note: '', phase: 'free' };
 }
+/**
+ * Rough char-per-token ratio used by the preflight estimator. Matches
+ * the same constant used by the base agent provider's prompt sizing.
+ */
+const PREFLIGHT_CHARS_PER_TOKEN = 4;
+/**
+ * Fraction of the context window held back for the model's reasoning
+ * + tool-call output. The agent emits structured findings JSON and may
+ * also produce thinking tokens; ~15% gives both room without being
+ * wasteful. Clamped to at least 2_048 tokens because below that, even
+ * a small `submitResult` payload can't fit.
+ */
+const PREFLIGHT_OUTPUT_RESERVE_RATIO = 0.15;
+const PREFLIGHT_MIN_OUTPUT_RESERVE_TOKENS = 2_048;
+
+/**
+ * Defense-in-depth preflight: before the agent loop calls generateText,
+ * estimate prompt tokens and refuse to proceed if they exceed the
+ * configured model's context window. Without this check, the Vercel AI
+ * SDK would retry the call up to `maxRetries` times against a 12K-context
+ * Llama with a 71K prompt — burning the AGENT_TIMEOUT_MS budget while
+ * each attempt fails identically.
+ *
+ * Pure function (no awaits, no I/O). Exported so it can be unit-tested.
+ * When contextWindowTokens is undefined we cannot enforce — callers that
+ * already resolve it (BaseCodeReviewAgentProvider does) will always pass
+ * a number.
+ */
+export function assertPromptFitsInContext(params: {
+    systemPrompt: string;
+    userPrompt: string;
+    contextWindowTokens: number | undefined;
+    modelName: string;
+}): void {
+    if (!params.contextWindowTokens || params.contextWindowTokens <= 0) {
+        return;
+    }
+    const promptChars =
+        (params.systemPrompt?.length ?? 0) + (params.userPrompt?.length ?? 0);
+    const estimatedTokens = Math.ceil(promptChars / PREFLIGHT_CHARS_PER_TOKEN);
+    const outputReserve = Math.max(
+        PREFLIGHT_MIN_OUTPUT_RESERVE_TOKENS,
+        Math.floor(params.contextWindowTokens * PREFLIGHT_OUTPUT_RESERVE_RATIO),
+    );
+    if (estimatedTokens + outputReserve > params.contextWindowTokens) {
+        throw new AgentPromptTooLargeError({
+            estimatedTokens,
+            contextWindowTokens: params.contextWindowTokens,
+            modelName: params.modelName,
+        });
+    }
+}
+
 export const AGENT_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes max per agent
 // 10 minutes per individual LLM call — matches the undici headersTimeout
 // set in the worker bootstrap so neither layer aborts the other. Large
@@ -776,6 +844,40 @@ function extractDoneToolResult<T>(result: any): T | null {
     return null;
 }
 
+/**
+ * Validate and sanitize a done-tool result against the FindingsOutput schema.
+ * Returns null if the result is null or fails validation, ensuring downstream
+ * code never receives a FindingsOutput with missing `suggestions`.
+ */
+export function sanitizeFindingsResult(
+    raw: FindingsOutput | null,
+): FindingsOutput | null {
+    if (!raw) return null;
+    const parsed = _findingsSchema.safeParse(raw);
+    if (parsed.success) return parsed.data;
+    logger.warn({
+        message:
+            '[DONE-TOOL] FindingsOutput failed Zod validation, falling back to text parsing',
+        context: 'AgentLoop',
+        metadata: {
+            zodErrors: parsed.error.issues.map(
+                (i) => `${i.path.join('.')}: ${i.message}`,
+            ),
+            rawKeys: Object.keys(raw),
+            hasSuggestions: Array.isArray((raw as any).suggestions),
+        },
+    });
+    // Attempt partial recovery: if suggestions is an array, keep it;
+    // otherwise fall back to text parsing (return null).
+    if (Array.isArray((raw as any).suggestions)) {
+        return {
+            reasoning: (raw as any).reasoning ?? '',
+            suggestions: (raw as any).suggestions,
+        };
+    }
+    return null;
+}
+
 export interface AgentLoopInput {
     model: LanguageModel;
     systemPrompt: string;
@@ -917,6 +1019,10 @@ export interface AgentLoopOutput {
     coverage: CoverageSummary;
     verification?: VerificationTraceSummary | null;
     anomalies: AgentAnomalySummary;
+    /** Fidelity warnings emitted during the loop (small context window
+     *  forced compact prompt, dropped callGraph, etc). Always present;
+     *  empty array when no adaptive strategy fired. */
+    warnings: ReviewWarning[];
 }
 
 interface SuggestionVerificationDecision {
@@ -1004,6 +1110,7 @@ async function runAgentLoopBody(
         input.repositoryFullName,
         secrets.documentationSearchService,
         secrets.documentationSearchOptions,
+        input.callGraph, // getCallers tool backed by the runtime call graph
     );
     // Self-contained mode: no sandbox, no tools. The agent analyzes diffs
     // and any inlined fileContent in a single LLM call. Used by CLI trial.
@@ -1056,6 +1163,19 @@ async function runAgentLoopBody(
             }),
     );
 
+    // Defense-in-depth: if the assembled prompt cannot fit, fail before
+    // the SDK retries the same doomed call up to maxRetries times.
+    // BaseCodeReviewAgentProvider has its own (coarser) overhead-only
+    // preflight; this one accounts for the actual systemPrompt +
+    // userPrompt size and catches cases where the overhead check passed
+    // but the diff content still pushes the total over the window.
+    assertPromptFitsInContext({
+        systemPrompt: input.systemPrompt,
+        userPrompt: input.userPrompt,
+        contextWindowTokens: input.contextWindowTokens,
+        modelName: (input.model as any)?.modelId ?? input.agentName ?? 'unknown',
+    });
+
     let result;
     try {
         result = await throttledGenerateText({
@@ -1069,6 +1189,14 @@ async function runAgentLoopBody(
                 generateText({
                     ...({ __kodusHardTimeoutMs: AGENT_TIMEOUT_MS } as any),
                     model: input.model,
+                    // Cap SDK-level retries to 1 on the main loop. The default
+                    // is 2 (3 total attempts); when the model genuinely can't
+                    // serve the prompt (context overflow, hard auth fail) the
+                    // extra retry burns minutes of the AGENT_TIMEOUT_MS budget
+                    // with no chance of succeeding. Cheap sub-calls
+                    // (severity classifier, dedup) keep the default since
+                    // their retries are short and cover real transient blips.
+                    maxRetries: 1,
                     abortSignal: abortController.signal,
                     system: withAnthropicCacheControl(
                         input.systemPrompt,
@@ -1137,8 +1265,8 @@ async function runAgentLoopBody(
                                 context: 'AgentLoop',
                             });
                         }
-                        const coverageDebt =
-                            formatCoverageDebt(coverageTargets);
+                        // Depth-first: no coverage-debt nudge (we don't force breadth).
+                        const coverageDebt = '';
 
                         // Context compression: if the message history is
                         // approaching the model's context window, truncate
@@ -1497,6 +1625,7 @@ async function runAgentLoopBody(
                     toolCalls: allToolCalls,
                     coverage: getCoverageSummary(coverageTargets),
                 }),
+                warnings: [],
             };
         }
         throw error;
@@ -1509,7 +1638,7 @@ async function runAgentLoopBody(
     // the validated tool args — no text parsing needed.
     const doneToolFindings = isSelfContained
         ? null
-        : extractDoneToolResult<FindingsOutput>(result);
+        : sanitizeFindingsResult(extractDoneToolResult<FindingsOutput>(result));
 
     if (doneToolFindings) {
         logger.log({
@@ -1692,6 +1821,12 @@ async function runAgentLoopBody(
         source = 'empty';
     }
 
+    // Defensive: ensure suggestions is always an array even when a
+    // malformed done-tool or fallback produced a FindingsOutput without it.
+    if (!Array.isArray(findings.suggestions)) {
+        findings = { ...findings, suggestions: [] };
+    }
+
     // Fast mode: skip heavy post-processing passes to keep latency low.
     // The main agent loop already ran with a capped step budget; spending
     // extra minutes on recovery/rescue/verify defeats the point of `--fast`.
@@ -1702,203 +1837,8 @@ async function runAgentLoopBody(
     const skipHeavyPasses =
         isFastMode || isSelfContained || !!input.skipHeavyPasses;
 
-    const coverageSummaryBeforeRecovery = getCoverageSummary(coverageTargets);
-    if (
-        !skipHeavyPasses &&
-        !isCoverageSatisfied(coverageSummaryBeforeRecovery) &&
-        allToolCalls.length > 0
-    ) {
-        logger.warn({
-            message: `[AGENT-COVERAGE-GAP] ${coverageSummaryBeforeRecovery.pendingTargets}/${coverageSummaryBeforeRecovery.totalTargets} changed files still uncovered after main pass`,
-            context: 'AgentLoop',
-            metadata: {
-                coverage: coverageSummaryBeforeRecovery,
-            },
-        });
-
-        const coverageRecovery = await runCoverageRecoveryPass({
-            input,
-            byokConfig: secrets.byokConfig,
-            queueTimeoutMs: secrets.byokQueueTimeoutMs,
-            tools,
-            coverageTargets,
-            allToolCalls,
-            totalInputTokens,
-            totalCacheReadTokens,
-            totalCacheWriteTokens,
-            totalOutputTokens,
-            totalReasoningTokens,
-        });
-
-        totalInputTokens = coverageRecovery.totalInputTokens;
-        totalCacheReadTokens = coverageRecovery.totalCacheReadTokens;
-        totalCacheWriteTokens = coverageRecovery.totalCacheWriteTokens;
-        totalOutputTokens = coverageRecovery.totalOutputTokens;
-        totalReasoningTokens = coverageRecovery.totalReasoningTokens;
-
-        if (coverageRecovery.text) {
-            let extraFindings = tryParseFindings(coverageRecovery.text);
-
-            if (!extraFindings && coverageRecovery.text.length > 50) {
-                logger.log({
-                    message: `[COVERAGE-RECOVERY] JSON parse failed (${coverageRecovery.text.length} chars), trying fallback model`,
-                    context: 'AgentLoop',
-                });
-                const fallbackResult = await structureWithFallbackModel(
-                    coverageRecovery.text,
-                    secrets.byokConfig,
-                    input.telemetryMetadata?.organizationId,
-                    secrets.byokQueueTimeoutMs,
-                );
-                if (fallbackResult) {
-                    extraFindings = fallbackResult.findings;
-                    totalInputTokens += fallbackResult.usage.inputTokens;
-                    totalCacheReadTokens +=
-                        fallbackResult.usage.cacheReadTokens;
-                    totalCacheWriteTokens +=
-                        fallbackResult.usage.cacheWriteTokens;
-                    totalOutputTokens += fallbackResult.usage.outputTokens;
-                    totalReasoningTokens +=
-                        fallbackResult.usage.reasoningTokens;
-                }
-            }
-
-            if (extraFindings) {
-                findings = mergeFindings(findings, extraFindings);
-                if (source === 'empty') {
-                    source = extraFindings ? 'json-parse' : source;
-                }
-            }
-        }
-    }
     let coverageSummary = getCoverageSummary(coverageTargets);
 
-    if (!skipHeavyPasses && shouldRunLowCoverageSecondChance(coverageSummary)) {
-        logger.warn({
-            message: `[AGENT-COVERAGE-SECOND-CHANCE] Coverage still low after recovery (${coverageSummary.touchedTargets}/${coverageSummary.totalTargets}). Running one more focused inspection pass.`,
-            context: 'AgentLoop',
-            metadata: {
-                coverage: coverageSummary,
-            },
-        });
-
-        const coverageSecondChance = await runLowCoverageSecondChance({
-            input,
-            byokConfig: secrets.byokConfig,
-            queueTimeoutMs: secrets.byokQueueTimeoutMs,
-            tools,
-            coverageTargets,
-            allToolCalls,
-            totalInputTokens,
-            totalCacheReadTokens,
-            totalCacheWriteTokens,
-            totalOutputTokens,
-            totalReasoningTokens,
-        });
-
-        totalInputTokens = coverageSecondChance.totalInputTokens;
-        totalCacheReadTokens = coverageSecondChance.totalCacheReadTokens;
-        totalCacheWriteTokens = coverageSecondChance.totalCacheWriteTokens;
-        totalOutputTokens = coverageSecondChance.totalOutputTokens;
-        totalReasoningTokens = coverageSecondChance.totalReasoningTokens;
-
-        if (coverageSecondChance.text) {
-            let extraFindings = tryParseFindings(coverageSecondChance.text);
-
-            if (!extraFindings && coverageSecondChance.text.length > 50) {
-                const fallbackResult = await structureWithFallbackModel(
-                    coverageSecondChance.text,
-                    secrets.byokConfig,
-                    input.telemetryMetadata?.organizationId,
-                    secrets.byokQueueTimeoutMs,
-                );
-                if (fallbackResult) {
-                    extraFindings = fallbackResult.findings;
-                    totalInputTokens += fallbackResult.usage.inputTokens;
-                    totalCacheReadTokens +=
-                        fallbackResult.usage.cacheReadTokens;
-                    totalCacheWriteTokens +=
-                        fallbackResult.usage.cacheWriteTokens;
-                    totalOutputTokens += fallbackResult.usage.outputTokens;
-                    totalReasoningTokens +=
-                        fallbackResult.usage.reasoningTokens;
-                }
-            }
-
-            if (extraFindings) {
-                findings = mergeFindings(findings, extraFindings);
-                if (source === 'empty') {
-                    source = 'json-parse';
-                }
-            }
-        }
-
-        coverageSummary = getCoverageSummary(coverageTargets);
-    }
-
-    // Third chance: one more pass if coverage is still below 70%
-    if (!skipHeavyPasses && shouldRunLowCoverageSecondChance(coverageSummary)) {
-        logger.warn({
-            message: `[AGENT-COVERAGE-THIRD-CHANCE] Coverage still low after second chance (${coverageSummary.touchedTargets}/${coverageSummary.totalTargets}). Running final inspection pass.`,
-            context: 'AgentLoop',
-            metadata: {
-                coverage: coverageSummary,
-            },
-        });
-
-        const coverageThirdChance = await runLowCoverageSecondChance({
-            input,
-            byokConfig: secrets.byokConfig,
-            queueTimeoutMs: secrets.byokQueueTimeoutMs,
-            tools,
-            coverageTargets,
-            allToolCalls,
-            totalInputTokens,
-            totalCacheReadTokens,
-            totalCacheWriteTokens,
-            totalOutputTokens,
-            totalReasoningTokens,
-        });
-
-        totalInputTokens = coverageThirdChance.totalInputTokens;
-        totalCacheReadTokens = coverageThirdChance.totalCacheReadTokens;
-        totalCacheWriteTokens = coverageThirdChance.totalCacheWriteTokens;
-        totalOutputTokens = coverageThirdChance.totalOutputTokens;
-        totalReasoningTokens = coverageThirdChance.totalReasoningTokens;
-
-        if (coverageThirdChance.text) {
-            let extraFindings = tryParseFindings(coverageThirdChance.text);
-
-            if (!extraFindings && coverageThirdChance.text.length > 50) {
-                const fallbackResult = await structureWithFallbackModel(
-                    coverageThirdChance.text,
-                    secrets.byokConfig,
-                    input.telemetryMetadata?.organizationId,
-                    secrets.byokQueueTimeoutMs,
-                );
-                if (fallbackResult) {
-                    extraFindings = fallbackResult.findings;
-                    totalInputTokens += fallbackResult.usage.inputTokens;
-                    totalCacheReadTokens +=
-                        fallbackResult.usage.cacheReadTokens;
-                    totalCacheWriteTokens +=
-                        fallbackResult.usage.cacheWriteTokens;
-                    totalOutputTokens += fallbackResult.usage.outputTokens;
-                    totalReasoningTokens +=
-                        fallbackResult.usage.reasoningTokens;
-                }
-            }
-
-            if (extraFindings) {
-                findings = mergeFindings(findings, extraFindings);
-                if (source === 'empty') {
-                    source = 'json-parse';
-                }
-            }
-        }
-
-        coverageSummary = getCoverageSummary(coverageTargets);
-    }
 
     if (!skipHeavyPasses && !input.skipSynthesisRescue) {
         const synthesisRescue = await runSynthesisRescuePass({
@@ -2075,522 +2015,8 @@ async function runAgentLoopBody(
             toolCalls: allToolCalls,
             coverage: coverageSummary,
         }),
+        warnings: [],
     };
-}
-
-async function runCoverageRecoveryPass(params: {
-    input: AgentLoopInput;
-    byokConfig?: BYOKConfig;
-    queueTimeoutMs?: number;
-    tools: Record<string, any>;
-    coverageTargets: ReturnType<typeof buildCoverageLedger>;
-    allToolCalls: AgentLoopOutput['toolCalls'];
-    totalInputTokens: number;
-    totalCacheReadTokens: number;
-    totalCacheWriteTokens: number;
-    totalOutputTokens: number;
-    totalReasoningTokens: number;
-}): Promise<{
-    text: string;
-    totalInputTokens: number;
-    totalCacheReadTokens: number;
-    totalCacheWriteTokens: number;
-    totalOutputTokens: number;
-    totalReasoningTokens: number;
-}> {
-    const {
-        input,
-        byokConfig,
-        queueTimeoutMs,
-        tools,
-        coverageTargets,
-        allToolCalls,
-        totalInputTokens,
-        totalCacheReadTokens,
-        totalCacheWriteTokens,
-        totalOutputTokens,
-        totalReasoningTokens,
-    } = params;
-    const remainingCoverageDebt = formatCoverageDebt(coverageTargets, 12);
-    if (!remainingCoverageDebt) {
-        return {
-            text: '',
-            totalInputTokens,
-            totalCacheReadTokens,
-            totalCacheWriteTokens,
-            totalOutputTokens,
-            totalReasoningTokens,
-        };
-    }
-
-    // Cache-friendly band-transition tracking (same strategy as main loop).
-    let recoveryEncourageAppended = false;
-    let recoveryUrgentAppended = false;
-
-    const investigationSummary = allToolCalls
-        .slice(-20)
-        .map((toolCall) => {
-            const args =
-                typeof toolCall.args === 'string'
-                    ? toolCall.args
-                    : JSON.stringify(toolCall.args);
-            return `${toolCall.toolName || toolCall.tool}(${args.substring(0, 150)})`;
-        })
-        .join('\n');
-
-    let recoveryStep = 0;
-    let recoveryText = '';
-    const recoverySignal = timeoutSignal(LLM_CALL_TIMEOUT_MS);
-
-    try {
-        const recoveryResult = await throttledGenerateText({
-            byokConfig,
-            organizationId: input.telemetryMetadata?.organizationId,
-            role: 'main',
-            label: `${input.agentName ?? 'agent-loop'}-coverage-recovery`,
-            abortSignal: recoverySignal,
-            queueTimeoutMs,
-            fn: () =>
-                generateText({
-                    abortSignal: recoverySignal,
-                    model: input.model,
-                    experimental_telemetry: _buildLangfuseTelemetry(
-                        `${input.agentName ?? 'agent-loop'}-coverage-recovery`,
-                        input.telemetryMetadata,
-                    ),
-                    providerOptions: buildProviderOptions(
-                        `${input.agentName ?? 'agent-loop'}-coverage-recovery`,
-                        input.telemetryMetadata,
-                        {
-                            reasoningEffort: input.reasoningEffort,
-                            reasoningConfigOverride:
-                                input.reasoningConfigOverride,
-                            byokProvider: input.byokProvider,
-                            modelName: (input.model as any)?.modelId,
-                            openrouterProviderOrder:
-                                input.openrouterProviderOrder,
-                            openrouterAllowFallbacks:
-                                input.openrouterAllowFallbacks,
-                        },
-                    ),
-                    system:
-                        input.systemPrompt +
-                        '\n\nIMPORTANT: This is a coverage recovery pass. You must inspect the remaining changed files before responding.',
-                    prompt: `You already investigated this review, but some changed files are still uncovered.
-
-<RecentInvestigation>
-${investigationSummary || 'No prior tool calls captured.'}
-</RecentInvestigation>
-
-<RemainingCoverage>
-${remainingCoverageDebt}
-</RemainingCoverage>
-
-Investigate the remaining changed files now.
-- Use tools to inspect each remaining file.
-- Prefer readFile on each remaining file.
-- When done, call submitResult with ADDITIONAL findings discovered from this recovery pass.
-- If no new findings appear, call submitResult with an empty suggestions array.
-`,
-                    tools: {
-                        ...tools,
-                        [DONE_TOOL_NAME]: buildDoneTools(input.model).findings,
-                    },
-                    stopWhen: [
-                        hasToolCall(DONE_TOOL_NAME),
-                        stepCountIs(MAX_STEPS_NORMAL),
-                    ],
-                    prepareStep: ({ stepNumber, messages }: any) => {
-                        recoveryStep = stepNumber;
-                        if (stepNumber >= MAX_STEPS_NORMAL - 1) {
-                            return {
-                                toolChoice: 'none' as const,
-                                activeTools: [],
-                                system:
-                                    input.systemPrompt +
-                                    '\n\nIMPORTANT: This is the final step of the coverage recovery pass. Do NOT call tools. Respond with JSON only.',
-                            };
-                        }
-
-                        const { note: stepBudgetNote, phase } =
-                            computeStepBudgetNote(stepNumber, MAX_STEPS_NORMAL);
-                        if (phase === 'urgent') {
-                            logger.log({
-                                message: `[AGENT-STEP-BUDGET] recovery urgent step=${stepNumber}/${MAX_STEPS_NORMAL}`,
-                                context: 'AgentLoop',
-                            });
-                        }
-
-                        // Cache-friendly: keep `system` immutable across
-                        // steps and append the budget/debt note as a
-                        // trailing user message only when the band first
-                        // transitions. Prior steps' prefix stays cached.
-                        let appendedNote: string | null = null;
-                        const debtSnapshot = formatCoverageDebt(
-                            coverageTargets,
-                            12,
-                        );
-                        if (phase === 'urgent' && !recoveryUrgentAppended) {
-                            appendedNote =
-                                stepBudgetNote.trim() +
-                                (debtSnapshot ? `\n\n${debtSnapshot}` : '');
-                            recoveryUrgentAppended = true;
-                        } else if (
-                            phase === 'encourage' &&
-                            !recoveryEncourageAppended
-                        ) {
-                            appendedNote =
-                                stepBudgetNote.trim() +
-                                (debtSnapshot ? `\n\n${debtSnapshot}` : '');
-                            recoveryEncourageAppended = true;
-                        }
-                        if (appendedNote) {
-                            return {
-                                messages: [
-                                    ...messages,
-                                    {
-                                        role: 'user' as const,
-                                        content: appendedNote,
-                                    },
-                                ],
-                            };
-                        }
-                        return {};
-                    },
-                    onStepFinish: (event: any) => {
-                        if (event.toolCalls) {
-                            for (const toolCall of event.toolCalls) {
-                                const args =
-                                    (toolCall as any).args ||
-                                    (toolCall as any).input ||
-                                    {};
-
-                                allToolCalls.push({
-                                    tool: toolCall.toolName,
-                                    toolName: toolCall.toolName,
-                                    args,
-                                    result: '',
-                                });
-
-                                markCoverageFromToolCall(
-                                    coverageTargets,
-                                    toolCall.toolName,
-                                    args,
-                                    recoveryStep,
-                                );
-                            }
-                        }
-
-                        if (event.text) {
-                            recoveryText = event.text;
-                        }
-                    },
-                }),
-        });
-
-        // Extract from done tool first, fall back to text
-        const doneResult =
-            extractDoneToolResult<FindingsOutput>(recoveryResult);
-        if (doneResult) {
-            recoveryText = JSON.stringify(doneResult);
-        } else {
-            recoveryText = recoveryResult.text || recoveryText;
-        }
-
-        const rUsage = extractUsage(
-            (recoveryResult as any).totalUsage ?? recoveryResult.usage ?? null,
-        );
-        return {
-            text: recoveryText,
-            totalInputTokens: totalInputTokens + rUsage.inputTokens,
-            totalCacheReadTokens: totalCacheReadTokens + rUsage.cacheReadTokens,
-            totalCacheWriteTokens:
-                totalCacheWriteTokens + rUsage.cacheWriteTokens,
-            totalOutputTokens: totalOutputTokens + rUsage.outputTokens,
-            totalReasoningTokens: totalReasoningTokens + rUsage.reasoningTokens,
-        };
-    } catch (error) {
-        logger.warn({
-            message: `[AGENT-COVERAGE-GAP] Recovery pass failed: ${error instanceof Error ? error.message : String(error)}`,
-            context: 'AgentLoop',
-        });
-
-        return {
-            text: '',
-            totalInputTokens,
-            totalCacheReadTokens,
-            totalCacheWriteTokens,
-            totalOutputTokens,
-            totalReasoningTokens,
-        };
-    }
-}
-
-function shouldRunLowCoverageSecondChance(
-    coverage: CoverageSummary | null | undefined,
-): boolean {
-    if (!coverage || coverage.totalTargets < 2) return false;
-    if (isCoverageSatisfied(coverage)) return false;
-
-    // Tiered mode: isCoverageSatisfied already encodes the contract
-    // (criticals + 70% total), so any false here means we must try again.
-    const tieringActive =
-        coverage.criticalTotal > 0 || coverage.optionalTotal > 0;
-    if (tieringActive) return true;
-
-    // Legacy mode keeps the historical 70% stop-trying floor so we don't
-    // grind away on a handful of leftover files in flat coverage mode.
-    const coveragePct = coverage.touchedTargets / coverage.totalTargets;
-    return coveragePct < TIERED_TOTAL_COVERAGE_THRESHOLD;
-}
-
-async function runLowCoverageSecondChance(params: {
-    input: AgentLoopInput;
-    byokConfig?: BYOKConfig;
-    queueTimeoutMs?: number;
-    tools: Record<string, any>;
-    coverageTargets: ReturnType<typeof buildCoverageLedger>;
-    allToolCalls: AgentLoopOutput['toolCalls'];
-    totalInputTokens: number;
-    totalCacheReadTokens: number;
-    totalCacheWriteTokens: number;
-    totalOutputTokens: number;
-    totalReasoningTokens: number;
-}): Promise<{
-    text: string;
-    totalInputTokens: number;
-    totalCacheReadTokens: number;
-    totalCacheWriteTokens: number;
-    totalOutputTokens: number;
-    totalReasoningTokens: number;
-}> {
-    const {
-        input,
-        byokConfig,
-        queueTimeoutMs,
-        tools,
-        coverageTargets,
-        allToolCalls,
-        totalInputTokens,
-        totalCacheReadTokens,
-        totalCacheWriteTokens,
-        totalOutputTokens,
-        totalReasoningTokens,
-    } = params;
-    const remainingCoverageDebt = formatCoverageDebt(coverageTargets, 12);
-    if (!remainingCoverageDebt) {
-        return {
-            text: '',
-            totalInputTokens,
-            totalCacheReadTokens,
-            totalCacheWriteTokens,
-            totalOutputTokens,
-            totalReasoningTokens,
-        };
-    }
-
-    // Cache-friendly band-transition tracking (same strategy as main loop).
-    let secondChanceEncourageAppended = false;
-    let secondChanceUrgentAppended = false;
-
-    const investigationSummary = allToolCalls
-        .slice(-24)
-        .map((toolCall) => {
-            const args =
-                typeof toolCall.args === 'string'
-                    ? toolCall.args
-                    : JSON.stringify(toolCall.args);
-            return `${toolCall.toolName || toolCall.tool}(${args.substring(0, 180)})`;
-        })
-        .join('\n');
-
-    let secondChanceStep = 0;
-    let secondChanceText = '';
-    const lowCoverageSignal = timeoutSignal(LLM_CALL_TIMEOUT_MS);
-
-    try {
-        const secondChanceResult = await throttledGenerateText({
-            byokConfig,
-            organizationId: input.telemetryMetadata?.organizationId,
-            role: 'main',
-            label: `${input.agentName ?? 'agent-loop'}-coverage-second-chance`,
-            abortSignal: lowCoverageSignal,
-            queueTimeoutMs,
-            fn: () =>
-                generateText({
-                    abortSignal: lowCoverageSignal,
-                    model: input.model,
-                    experimental_telemetry: _buildLangfuseTelemetry(
-                        `${input.agentName ?? 'agent-loop'}-coverage-second-chance`,
-                        input.telemetryMetadata,
-                    ),
-                    providerOptions: buildProviderOptions(
-                        `${input.agentName ?? 'agent-loop'}-coverage-second-chance`,
-                        input.telemetryMetadata,
-                        {
-                            reasoningEffort: input.reasoningEffort,
-                            reasoningConfigOverride:
-                                input.reasoningConfigOverride,
-                            byokProvider: input.byokProvider,
-                            modelName: (input.model as any)?.modelId,
-                            openrouterProviderOrder:
-                                input.openrouterProviderOrder,
-                            openrouterAllowFallbacks:
-                                input.openrouterAllowFallbacks,
-                        },
-                    ),
-                    system:
-                        input.systemPrompt +
-                        '\n\nIMPORTANT: Coverage is still too low. This is a final targeted inspection pass. You must inspect the remaining changed files with readFile before responding.',
-                    prompt: `Your previous review finished with low changed-file coverage.
-
-<RecentInvestigation>
-${investigationSummary || 'No prior tool calls captured.'}
-</RecentInvestigation>
-
-<RemainingCoverage>
-${remainingCoverageDebt}
-</RemainingCoverage>
-
-Instructions:
-- Focus only on the remaining uncovered changed files.
-- Use readFile on those files before responding.
-- Be surgical: inspect remaining files, then call submitResult with ADDITIONAL findings.
-- If the remaining files are safe, call submitResult with an empty suggestions array.`,
-                    tools: {
-                        ...tools,
-                        [DONE_TOOL_NAME]: buildDoneTools(input.model).findings,
-                    },
-                    stopWhen: [
-                        hasToolCall(DONE_TOOL_NAME),
-                        stepCountIs(MAX_STEPS_NORMAL),
-                    ],
-                    prepareStep: ({ stepNumber, messages }: any) => {
-                        secondChanceStep = stepNumber;
-                        if (stepNumber >= MAX_STEPS_NORMAL - 1) {
-                            return {
-                                toolChoice: 'none' as const,
-                                activeTools: [],
-                                system:
-                                    input.systemPrompt +
-                                    '\n\nIMPORTANT: Final step of the low-coverage second chance. Do NOT call tools. Return JSON only.',
-                            };
-                        }
-
-                        const { note: stepBudgetNote, phase } =
-                            computeStepBudgetNote(stepNumber, MAX_STEPS_NORMAL);
-                        if (phase === 'urgent') {
-                            logger.log({
-                                message: `[AGENT-STEP-BUDGET] second-chance urgent step=${stepNumber}/${MAX_STEPS_NORMAL}`,
-                                context: 'AgentLoop',
-                            });
-                        }
-
-                        // Cache-friendly: keep system immutable, append
-                        // budget/debt note only on band transitions.
-                        let appendedNote: string | null = null;
-                        const debtSnapshot = formatCoverageDebt(
-                            coverageTargets,
-                            12,
-                        );
-                        if (phase === 'urgent' && !secondChanceUrgentAppended) {
-                            appendedNote =
-                                stepBudgetNote.trim() +
-                                (debtSnapshot ? `\n\n${debtSnapshot}` : '');
-                            secondChanceUrgentAppended = true;
-                        } else if (
-                            phase === 'encourage' &&
-                            !secondChanceEncourageAppended
-                        ) {
-                            appendedNote =
-                                stepBudgetNote.trim() +
-                                (debtSnapshot ? `\n\n${debtSnapshot}` : '');
-                            secondChanceEncourageAppended = true;
-                        }
-                        if (appendedNote) {
-                            return {
-                                messages: [
-                                    ...messages,
-                                    {
-                                        role: 'user' as const,
-                                        content: appendedNote,
-                                    },
-                                ],
-                            };
-                        }
-                        return {};
-                    },
-                    onStepFinish: (event: any) => {
-                        if (event.toolCalls) {
-                            for (const toolCall of event.toolCalls) {
-                                const args =
-                                    (toolCall as any).args ||
-                                    (toolCall as any).input ||
-                                    {};
-
-                                allToolCalls.push({
-                                    tool: toolCall.toolName,
-                                    toolName: toolCall.toolName,
-                                    args,
-                                    result: '',
-                                });
-
-                                markCoverageFromToolCall(
-                                    coverageTargets,
-                                    toolCall.toolName,
-                                    args,
-                                    secondChanceStep,
-                                );
-                            }
-                        }
-
-                        if (event.text) {
-                            secondChanceText = event.text;
-                        }
-                    },
-                }),
-        });
-
-        // Extract from done tool first, fall back to text
-        const doneResult =
-            extractDoneToolResult<FindingsOutput>(secondChanceResult);
-        if (doneResult) {
-            secondChanceText = JSON.stringify(doneResult);
-        } else {
-            secondChanceText = secondChanceResult.text || secondChanceText;
-        }
-
-        const scuUsage = extractUsage(
-            (secondChanceResult as any).totalUsage ??
-                secondChanceResult.usage ??
-                null,
-        );
-        return {
-            text: secondChanceText,
-            totalInputTokens: totalInputTokens + scuUsage.inputTokens,
-            totalCacheReadTokens:
-                totalCacheReadTokens + scuUsage.cacheReadTokens,
-            totalCacheWriteTokens:
-                totalCacheWriteTokens + scuUsage.cacheWriteTokens,
-            totalOutputTokens: totalOutputTokens + scuUsage.outputTokens,
-            totalReasoningTokens:
-                totalReasoningTokens + scuUsage.reasoningTokens,
-        };
-    } catch (error) {
-        logger.warn({
-            message: `[AGENT-COVERAGE-SECOND-CHANCE] Focused inspection pass failed: ${error instanceof Error ? error.message : String(error)}`,
-            context: 'AgentLoop',
-        });
-
-        return {
-            text: '',
-            totalInputTokens,
-            totalCacheReadTokens,
-            totalCacheWriteTokens,
-            totalOutputTokens,
-            totalReasoningTokens,
-        };
-    }
 }
 
 async function runSynthesisRescuePass(params: {
@@ -2630,8 +2056,10 @@ async function runSynthesisRescuePass(params: {
     let totalOutputTokens = initialTotalOutputTokens;
     let totalReasoningTokens = initialTotalReasoningTokens;
 
-    const currentFindingsSummary = findings.suggestions.length
-        ? findings.suggestions
+    const safeSuggestions = findings.suggestions ?? [];
+
+    const currentFindingsSummary = safeSuggestions.length
+        ? safeSuggestions
               .map((suggestion, index) =>
                   [
                       `${index + 1}. ${suggestion.relevantFile}`,
@@ -2773,11 +2201,11 @@ Return ONLY JSON:
         totalReasoningTokens += usage.reasoningTokens;
 
         logger.log({
-            message: `[AGENT-SYNTHESIS-RESCUE] before=${findings.suggestions.length} added=${extraFindings?.suggestions.length ?? 0}`,
+            message: `[AGENT-SYNTHESIS-RESCUE] before=${safeSuggestions.length} added=${extraFindings?.suggestions?.length ?? 0}`,
             context: 'AgentLoop',
             metadata: {
-                currentFindings: findings.suggestions.length,
-                addedFindings: extraFindings?.suggestions.length ?? 0,
+                currentFindings: safeSuggestions.length,
+                addedFindings: extraFindings?.suggestions?.length ?? 0,
                 inspectedFiles: inspectedFilesSummary
                     .split('\n')
                     .filter(Boolean).length,
@@ -2810,12 +2238,15 @@ Return ONLY JSON:
     }
 }
 
-function mergeFindings(
+export function mergeFindings(
     base: FindingsOutput,
     extra: FindingsOutput,
 ): FindingsOutput {
+    const baseSuggestions = base.suggestions ?? [];
+    const extraSuggestions = extra.suggestions ?? [];
+
     const seen = new Set(
-        base.suggestions.map((suggestion) =>
+        baseSuggestions.map((suggestion) =>
             [
                 suggestion.relevantFile,
                 suggestion.relevantLinesStart ?? '',
@@ -2825,7 +2256,7 @@ function mergeFindings(
         ),
     );
 
-    const additionalSuggestions = extra.suggestions.filter((suggestion) => {
+    const additionalSuggestions = extraSuggestions.filter((suggestion) => {
         const key = [
             suggestion.relevantFile,
             suggestion.relevantLinesStart ?? '',
@@ -2842,7 +2273,7 @@ function mergeFindings(
         reasoning: [base.reasoning, extra.reasoning]
             .filter(Boolean)
             .join('\n\n'),
-        suggestions: [...base.suggestions, ...additionalSuggestions],
+        suggestions: [...baseSuggestions, ...additionalSuggestions],
     };
 }
 
@@ -3610,30 +3041,29 @@ export function buildVerifierPrompt(
     return {
         system: `You are a surgical code review verifier.
 
-Your task is to verify ONE candidate finding.
+Your task is to verify ONE candidate finding: confirm or REFUTE its technical claim.
+You are NOT re-deciding whether it is "worth reporting" — the finder already promoted it.
+Your job is correctness, not taste. The bar to remove a finding is a REFUTATION, not a doubt.
 
 Rules:
 - You may use only a few tool calls. Be surgical.
-- Use tools to confirm or refute the candidate finding.
+- Use tools to confirm or REFUTE the candidate finding.
 - Treat call graph hints as fast navigation hints, not as final proof.
 - You must NOT create a new finding unrelated to the candidate.
 - Do NOT rewrite the finding text, summary, severity, or suggested fix.
 
-Drop criteria — drop the finding if ANY of these apply:
-- The finding is speculative: it describes a theoretical concern without pointing to a concrete failure path in the changed code (e.g. "lacks rate limiting", "could cause performance issues", "consider adding validation").
-- The finding is a pure efficiency concern without a failure path: O(N) queries, N+1 queries, redundant allocations, eager evaluation, synchronous operations in async context — UNLESS it causes a crash, timeout, or data corruption under normal usage.
-- The finding describes a missing defensive measure (missing CSRF, missing rate limit, missing input validation, missing authentication) without evidence that the omission is exploitable in the specific changed code.
-- The finding describes a pre-existing pattern that is NOT made worse by this PR.
-- The finding is about code style, naming, documentation, or best practices rather than a concrete bug.
-- The root cause described is factually wrong (e.g. claims something is not imported when it is).
+DROP the finding ONLY if you can actively REFUTE it — concrete evidence that it is wrong or cannot happen:
+- The root cause described is factually wrong (e.g. claims something is not imported when it is; claims a value can be null when it provably cannot).
+- The failure path is impossible given the actual code: a guard upstream prevents it, the branch is unreachable, or the value is already validated before use.
+- It is pure code style, naming, documentation, or formatting — not a behavior bug.
+- It is a generic "missing X" suggestion (missing rate limit / validation / CSRF / auth) with NO concrete code path where the omission produces a wrong outcome.
 
-Keep criteria — keep the finding only if ALL of these apply:
-- The finding identifies a concrete defect: wrong behavior, crash, data corruption, or security vulnerability.
-- The root cause is in lines added or modified by this PR.
-- You can trace a specific failure path from the changed code to the bad outcome.
-- The failure can happen under normal usage, not just under adversarial or extreme conditions.
+KEEP the finding (this is the DEFAULT) whenever you cannot refute it. Do NOT drop a finding merely because:
+- the trigger is concurrent, adversarial, or an edge condition — race conditions, SSRF, auth/FIPS bypass, and injection are REAL bugs, not "speculative" or "extreme";
+- the root cause is reached from a caller in another file — cross-file bugs are real; trace the path before judging;
+- the bug is not literally on a changed line, as long as the PR's change activates, exposes, or fails to guard it.
 
-When in doubt between a speculative concern and a real bug, DROP. Precision matters more than recall at this stage — a downstream reviewer exists.
+When in doubt, KEEP — a human reviewer makes the final call. Recall of real defects matters more here than trimming the last few low-value findings.
 
 Return JSON only at the end.`,
         prompt: `${evidenceBundle}

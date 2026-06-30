@@ -5,6 +5,10 @@ import {
     getClassification,
     isTerminalCategory,
 } from './error-classifier';
+import {
+    AgentContextWindowTooSmallError,
+    AgentPromptTooLargeError,
+} from './errors';
 
 function errorWithStatus(message: string, status: number): Error {
     const err = new Error(message) as Error & { status: number };
@@ -33,6 +37,36 @@ describe('classifyLLMError', () => {
             expect(classifyLLMError(err).category).toBe(
                 ReviewErrorCategory.MODEL_NOT_FOUND,
             );
+        });
+
+        it('reads the access-denied detail from responseBody when message is just "Not Found"', () => {
+            // Mirrors @ai-sdk APICallError: terse message, detail in body.
+            const err = Object.assign(new Error('Not Found'), {
+                statusCode: 404,
+                responseBody: JSON.stringify({
+                    error: {
+                        code: 404,
+                        message:
+                            'Publisher Model `.../publishers/anthropic/models/claude-sonnet-4-6` was not found or your project does not have access to it.',
+                        status: 'NOT_FOUND',
+                    },
+                }),
+            });
+            expect(classifyLLMError(err, 'google_vertex').category).toBe(
+                ReviewErrorCategory.MODEL_ACCESS_DENIED,
+            );
+        });
+
+        it('maps Vertex 404 "does not have access" → MODEL_ACCESS_DENIED with Model Garden guidance', () => {
+            const err = errorWithStatus(
+                'Publisher Model `projects/p/locations/global/publishers/anthropic/models/claude-sonnet-4-6` was not found or your project does not have access to it.',
+                404,
+            );
+            const info = classifyLLMError(err, 'google_vertex');
+            expect(info.category).toBe(
+                ReviewErrorCategory.MODEL_ACCESS_DENIED,
+            );
+            expect(info.friendlyMessage).toMatch(/Model Garden/i);
         });
 
         it('disambiguates 429 with quota-ish wording → QUOTA_EXCEEDED', () => {
@@ -186,6 +220,67 @@ describe('classifyLLMError', () => {
             }
         });
     });
+
+    describe('context-overflow friendly message — actionable variants', () => {
+        it('AgentContextWindowTooSmallError surfaces the exact numbers and 3 options', () => {
+            const err = new AgentContextWindowTooSmallError({
+                contextWindow: 12_288,
+                overheadTokens: 17_192,
+                modelName: 'google_gemini:gemini-2.5-flash',
+            });
+            const msg = classifyLLMError(err).friendlyMessage;
+            // The specific diagnosis with model and numbers.
+            expect(msg).toContain('google_gemini:gemini-2.5-flash');
+            expect(msg).toContain('12,288');
+            expect(msg).toContain('17,192');
+            // All three action options.
+            expect(msg).toContain('Switch to a recommended model');
+            expect(msg).toContain('Split the PR');
+            expect(msg).toContain('byokConfig.main.maxInputTokens');
+            // Names of curated models (the ones shown as cards in BYOK
+            // settings — admins should recognize these).
+            expect(msg).toContain('Claude Sonnet 4.6');
+            expect(msg).toContain('Gemini 3.1 Pro');
+        });
+
+        it('AgentPromptTooLargeError surfaces the estimated prompt size', () => {
+            const err = new AgentPromptTooLargeError({
+                estimatedTokens: 71_110,
+                contextWindowTokens: 12_288,
+                modelName: 'llama-12k',
+            });
+            const msg = classifyLLMError(err).friendlyMessage;
+            expect(msg).toContain('llama-12k');
+            expect(msg).toContain('12,288');
+            expect(msg).toContain('71,110');
+            expect(msg).toContain('Switch to a recommended model');
+        });
+
+        it('raw provider context-overflow (no typed error) omits BYOK-limit option but keeps the others', () => {
+            const err = new Error(
+                'This model has a maximum context length of 128000 tokens',
+            );
+            const msg = classifyLLMError(err).friendlyMessage;
+            // Diagnosis is generic (no specific numbers — we don't have them).
+            expect(msg).toContain('exceeded the maximum context size');
+            // Switch-model + split-PR options are present.
+            expect(msg).toContain('Switch to a recommended model');
+            expect(msg).toContain('Split the PR');
+            // BYOK-limit option is omitted (no specific window to compare).
+            expect(msg).not.toContain('byokConfig.main.maxInputTokens');
+        });
+
+        it('renders as GitHub-flavored Markdown (bold + bullets) so the PR comment formats correctly', () => {
+            const err = new AgentContextWindowTooSmallError({
+                contextWindow: 12_288,
+                overheadTokens: 17_192,
+                modelName: 'x',
+            });
+            const msg = classifyLLMError(err).friendlyMessage;
+            expect(msg).toContain('**To resolve, choose one:**');
+            expect(msg.split('\n').filter((l) => l.startsWith('- ')).length).toBe(3);
+        });
+    });
 });
 
 describe('isTerminalCategory', () => {
@@ -193,6 +288,7 @@ describe('isTerminalCategory', () => {
         ReviewErrorCategory.AUTH_INVALID,
         ReviewErrorCategory.QUOTA_EXCEEDED,
         ReviewErrorCategory.MODEL_NOT_FOUND,
+        ReviewErrorCategory.MODEL_ACCESS_DENIED,
     ])('%s is terminal', (cat) => {
         expect(isTerminalCategory(cat)).toBe(true);
     });

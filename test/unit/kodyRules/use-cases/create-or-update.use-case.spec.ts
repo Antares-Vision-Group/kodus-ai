@@ -40,8 +40,10 @@ describe('CreateOrUpdateKodyRulesUseCase (centralized pending states)', () => {
         createMutationPullRequestIfEnabled: jest.Mock;
         getCentralizedRepositoryIfEnabled: jest.Mock;
         resolveRepositoryFolderName: jest.Mock;
+        resolveDirectoryGroupFolderName: jest.Mock;
         buildCentralizedPath: jest.Mock;
         sanitizeFileName: jest.Mock;
+        buildRuleFileName: jest.Mock;
     };
 
     beforeEach(async () => {
@@ -55,8 +57,18 @@ describe('CreateOrUpdateKodyRulesUseCase (centralized pending states)', () => {
             createMutationPullRequestIfEnabled: jest.fn(),
             getCentralizedRepositoryIfEnabled: jest.fn(),
             resolveRepositoryFolderName: jest.fn(),
+            resolveDirectoryGroupFolderName: jest
+                .fn()
+                .mockResolvedValue(null),
             buildCentralizedPath: jest.fn(),
             sanitizeFileName: jest.fn(),
+            buildRuleFileName: jest.fn(
+                (title?: string, uuid?: string) =>
+                    `${centralizedConfigPrServiceMock.sanitizeFileName(
+                        title,
+                        'rule',
+                    )}${uuid ? `-${String(uuid).slice(0, 8)}` : ''}.yml`,
+            ),
         };
 
         centralizedConfigPrServiceMock.getCentralizedRepositoryIfEnabled.mockResolvedValue(
@@ -137,7 +149,7 @@ describe('CreateOrUpdateKodyRulesUseCase (centralized pending states)', () => {
                 severity: 'medium' as any,
                 scope: KodyRulesScope.FILE,
                 path: '**/*',
-                origin: KodyRulesOrigin.USER,
+                origin: KodyRulesOrigin.MANUAL,
                 repositoryId: 'repo-1',
                 examples: [],
             },
@@ -181,7 +193,7 @@ describe('CreateOrUpdateKodyRulesUseCase (centralized pending states)', () => {
             severity: 'medium',
             scope: KodyRulesScope.FILE,
             path: '**/*',
-            origin: KodyRulesOrigin.USER,
+            origin: KodyRulesOrigin.MANUAL,
             repositoryId: 'repo-1',
             status: KodyRulesStatus.ACTIVE,
             centralizedConfig: {
@@ -202,7 +214,7 @@ describe('CreateOrUpdateKodyRulesUseCase (centralized pending states)', () => {
                 severity: 'medium' as any,
                 scope: KodyRulesScope.FILE,
                 path: '**/*',
-                origin: KodyRulesOrigin.USER,
+                origin: KodyRulesOrigin.MANUAL,
                 repositoryId: 'repo-1',
                 examples: [],
             },
@@ -259,7 +271,7 @@ describe('CreateOrUpdateKodyRulesUseCase (centralized pending states)', () => {
                 severity: 'high' as any,
                 scope: KodyRulesScope.FILE,
                 path: '**/*',
-                origin: KodyRulesOrigin.USER,
+                origin: KodyRulesOrigin.MANUAL,
                 repositoryId: 'global',
                 examples: [],
             },
@@ -324,7 +336,7 @@ describe('CreateOrUpdateKodyRulesUseCase (centralized pending states)', () => {
             severity: 'medium',
             scope: KodyRulesScope.FILE,
             path: '**/*',
-            origin: KodyRulesOrigin.USER,
+            origin: KodyRulesOrigin.MANUAL,
             repositoryId: 'repo-1',
             status: KodyRulesStatus.ACTIVE,
             centralizedConfig: undefined,
@@ -342,7 +354,7 @@ describe('CreateOrUpdateKodyRulesUseCase (centralized pending states)', () => {
                 severity: 'medium' as any,
                 scope: KodyRulesScope.FILE,
                 path: '**/*',
-                origin: KodyRulesOrigin.USER,
+                origin: KodyRulesOrigin.MANUAL,
                 repositoryId: 'repo-1',
                 examples: [],
             },
@@ -364,7 +376,7 @@ describe('CreateOrUpdateKodyRulesUseCase (centralized pending states)', () => {
                 uuid: 'rule-legacy-1',
                 status: KodyRulesStatus.ACTIVE,
                 centralizedConfig: {
-                    path: 'repo-one/.kody-rules/review/legacy-title.yml',
+                    path: 'repo-one/.kody-rules/review/legacy-title-rule-leg.yml',
                     status: KodyRuleCentralizedStatus.PENDING_EDIT,
                 },
             }),
@@ -385,7 +397,7 @@ describe('CreateOrUpdateKodyRulesUseCase (centralized pending states)', () => {
                 severity: 'medium' as any,
                 scope: KodyRulesScope.FILE,
                 path: '**/*',
-                origin: KodyRulesOrigin.USER,
+                origin: KodyRulesOrigin.MANUAL,
                 repositoryId: 'repo-1',
                 examples: [],
             },
@@ -430,7 +442,7 @@ describe('CreateOrUpdateKodyRulesUseCase (centralized pending states)', () => {
                     severity: 'medium' as any,
                     scope: KodyRulesScope.FILE,
                     path: '**/*',
-                    origin: KodyRulesOrigin.USER,
+                    origin: KodyRulesOrigin.MANUAL,
                     repositoryId: 'repo-1',
                     examples: [],
                 },

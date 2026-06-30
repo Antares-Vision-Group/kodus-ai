@@ -7,7 +7,15 @@ import type {
     ReviewSignal,
     WebhookInfo,
 } from "../lib/types.js";
-import { BaseProvider, nowIso, pollUntil, requireEnv } from "./base.js";
+import { randomUUID } from "node:crypto";
+import type { Target } from "../lib/types.js";
+import {
+    BaseProvider,
+    nowIso,
+    pollUntil,
+    requireEnv,
+    resolveTargetRepo,
+} from "./base.js";
 import { ensureOk, http } from "../lib/http.js";
 import { prepareBranch } from "../lib/git.js";
 import { logger } from "../lib/log.js";
@@ -39,9 +47,16 @@ export class GitHubProvider extends BaseProvider {
     protected readonly apiBase = "https://api.github.com";
     protected readonly existingPrNumber?: number;
 
-    constructor(opts?: { repoOverride?: string }) {
+    constructor(opts?: {
+        repoOverride?: string;
+        target?: Target;
+        tokenOverride?: string;
+    }) {
         super();
-        this.token = requireEnv("GH_TEST_TOKEN");
+        // tokenOverride is the round-robin token the matrix runner assigns
+        // from the bot-account pool (see lib/github-token-pool.ts). Falls back
+        // to the single GH_TEST_TOKEN when no pool is configured.
+        this.token = opts?.tokenOverride || requireEnv("GH_TEST_TOKEN");
         // Subclasses (notably GitHubAppProvider) need to target a
         // DIFFERENT repo than the PAT-driven default — the GitHub App
         // is installed scope-limited to that other repo, so any PR we
@@ -49,7 +64,9 @@ export class GitHubProvider extends BaseProvider {
         // webhook. Pass repoOverride to redirect this provider's
         // entire surface (clone URL, /repos/<owner>/<repo>/*, webhook
         // listing) to the App-bound repo.
-        this.repoFullName = opts?.repoOverride ?? requireEnv("GH_TEST_REPO");
+        this.repoFullName =
+            opts?.repoOverride ??
+            resolveTargetRepo("GH_TEST_REPO", opts?.target ?? "self-hosted");
         const existing = process.env.GH_TEST_PR_NUMBER;
         if (existing) this.existingPrNumber = Number(existing);
     }
@@ -169,11 +186,77 @@ export class GitHubProvider extends BaseProvider {
     }
 
     async openPRFromBranches(args: OpenPRFromBranchesArgs): Promise<OpenedPR> {
-        // Self-heal: GitHub refuses to open a second open PR for the same
-        // head→base combo. If a previous run crashed before `closePR` (or a
-        // human left a standing PR there), close it first so we can open
-        // fresh.
-        await this.closeOpenPRsBetween(args.head, args.base);
+        // GitHub's git data endpoints (create-commit / create-ref) intermittently
+        // return HTTP 500 under no fault of ours. http() only retries transport
+        // failures, not 5xx statuses, so a single hiccup would silently cost us
+        // a benchmark review. Retry the whole sequence on 5xx — each attempt
+        // mints a fresh uid/branch, so a half-applied ref from a "500 but it
+        // actually worked" never collides (422) on the next try.
+        let lastErr: unknown;
+        for (let attempt = 0; attempt < 4; attempt++) {
+            try {
+                return await this.openPRFromBranchesOnce(args);
+            } catch (err) {
+                lastErr = err;
+                if (!/HTTP 5\d\d/.test((err as Error).message) || attempt === 3) {
+                    throw err;
+                }
+                await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+            }
+        }
+        throw lastErr;
+    }
+
+    private async openPRFromBranchesOnce(
+        args: OpenPRFromBranchesArgs,
+    ): Promise<OpenedPR> {
+        // Open the PR from a UNIQUE throwaway branch carrying a fresh empty
+        // commit on top of the fixture tip — never from the shared fixture
+        // branch. GitHub caps a repo at 100 PRs sharing a head_sha, so opening
+        // every PR off the fixture tip burns the repo out (HTTP 422). An empty
+        // commit (same tree, parent = fixture tip) gives each PR a UNIQUE
+        // head_sha with an IDENTICAL diff vs base, and a unique branch name
+        // sidesteps the "one open PR per head→base" limit. The fixture branch
+        // is never modified; closePR deletes the throwaway.
+        const tip = await http<{ object: { sha: string } }>(
+            `${this.apiBase}/repos/${this.repoFullName}/git/ref/heads/${args.head}`,
+            { headers: this.headers() },
+        );
+        ensureOk(tip, "github:openPRFromBranches:resolveHead");
+        const headSha = tip.body.object.sha;
+        const commitInfo = await http<{ tree: { sha: string } }>(
+            `${this.apiBase}/repos/${this.repoFullName}/git/commits/${headSha}`,
+            { headers: this.headers() },
+        );
+        ensureOk(commitInfo, "github:openPRFromBranches:resolveTree");
+
+        const uid = randomUUID().slice(0, 8);
+        const throwaway = `e2e/${args.head.replace(/[^a-zA-Z0-9._-]+/g, "-")}-${uid}`;
+        const commit = await http<{ sha: string }>(
+            `${this.apiBase}/repos/${this.repoFullName}/git/commits`,
+            {
+                method: "POST",
+                headers: this.headers(),
+                body: {
+                    message: `[e2e] throwaway head for ${args.head} (${uid})`,
+                    tree: commitInfo.body.tree.sha,
+                    parents: [headSha],
+                },
+            },
+        );
+        ensureOk(commit, "github:openPRFromBranches:commit");
+        const ref = await http(
+            `${this.apiBase}/repos/${this.repoFullName}/git/refs`,
+            {
+                method: "POST",
+                headers: this.headers(),
+                body: {
+                    ref: `refs/heads/${throwaway}`,
+                    sha: commit.body.sha,
+                },
+            },
+        );
+        ensureOk(ref, "github:openPRFromBranches:ref");
 
         const resp = await http<{ number: number; html_url: string }>(
             `${this.apiBase}/repos/${this.repoFullName}/pulls`,
@@ -183,7 +266,7 @@ export class GitHubProvider extends BaseProvider {
                 body: {
                     title: args.title,
                     body: args.body,
-                    head: args.head,
+                    head: throwaway,
                     base: args.base,
                 },
             },
@@ -192,9 +275,9 @@ export class GitHubProvider extends BaseProvider {
         return {
             number: resp.body.number,
             url: resp.body.html_url,
-            branch: args.head,
+            branch: throwaway,
             baseBranch: args.base,
-            keepBranchOnClose: true,
+            keepBranchOnClose: false,
         };
     }
 
@@ -487,6 +570,127 @@ export class GitHubProvider extends BaseProvider {
         return { id: String(resp.body.id) };
     }
 
+    // Posts an issue comment AS A DIFFERENT GitHub identity (token override).
+    // The conversation scenario needs this: Kody ignores any comment whose
+    // author login contains "kody"/"kodus" (isKodyComment → treats it as its
+    // own), and the e2e bots are all `kodus-e2e-bot-N`. So the `@kody` mention
+    // must come from a non-Kody account.
+    async postCommentAs(
+        prNumber: number,
+        body: string,
+        token: string,
+    ): Promise<{ id: string }> {
+        const resp = await http<{ id: number }>(
+            `${this.apiBase}/repos/${this.repoFullName}/issues/${prNumber}/comments`,
+            {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    Accept: "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                body: { body },
+            },
+        );
+        ensureOk(resp, "github:postCommentAs");
+        return { id: String(resp.body.id) };
+    }
+
+    // Posts an INLINE review comment as a different identity (token override).
+    // Kody's ConversationAgent only resolves the mention when it's a review
+    // (inline) comment — `getPullRequestReviewComment` lists review comments
+    // only, so an issue comment is never found and the flow silently returns.
+    // We attach it at file level (subject_type=file) so no valid diff line is
+    // needed. Returns the new review comment id.
+    async postReviewCommentAs(
+        prNumber: number,
+        body: string,
+        token: string,
+    ): Promise<{ id: string }> {
+        const h = {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        };
+        const pr = await http<{ head: { sha: string } }>(
+            `${this.apiBase}/repos/${this.repoFullName}/pulls/${prNumber}`,
+            { headers: h },
+        );
+        ensureOk(pr, "github:postReviewCommentAs:getPR");
+        const files = await http<{ filename: string }[]>(
+            `${this.apiBase}/repos/${this.repoFullName}/pulls/${prNumber}/files`,
+            { headers: h },
+        );
+        ensureOk(files, "github:postReviewCommentAs:getFiles");
+        const path = files.body?.[0]?.filename;
+        const resp = await http<{ id: number }>(
+            `${this.apiBase}/repos/${this.repoFullName}/pulls/${prNumber}/comments`,
+            {
+                method: "POST",
+                headers: h,
+                body: {
+                    body,
+                    commit_id: pr.body.head.sha,
+                    path,
+                    subject_type: "file",
+                },
+            },
+        );
+        ensureOk(resp, "github:postReviewCommentAs");
+        return { id: String(resp.body.id) };
+    }
+
+    // Polls for Kody's conversational reply to an `@kody <question>` review
+    // comment (the kodus-flow ConversationAgent path → v2/BYOK). Kody replies
+    // via createReplyForReviewComment, so the answer lands in the PR's REVIEW
+    // comments. Returns the first NEW review comment that is neither ours
+    // (`@kody …`) nor a code-review finding (those carry the
+    // `<!-- kody-codereview` marker). null at timeout.
+    async pollForKodyReply(
+        pr: { number: number },
+        opts: { sinceIso: string; triggerId?: string; timeoutSec?: number },
+    ): Promise<{ id: string; body: string } | null> {
+        const since = encodeURIComponent(opts.sinceIso);
+        return pollUntil(
+            async () => {
+                const comments = await http<
+                    { id: number; body: string; created_at?: string }[]
+                >(
+                    `${this.apiBase}/repos/${this.repoFullName}/pulls/${pr.number}/comments?since=${since}`,
+                    { headers: this.headers() },
+                );
+                for (const c of comments.body ?? []) {
+                    if (String(c.id) === opts.triggerId) continue;
+                    const body = c.body ?? "";
+                    if (body.toLowerCase().startsWith("@kody")) continue;
+                    // Skip code-review status/findings — conversation replies
+                    // don't carry the review discriminator.
+                    if (body.includes("<!-- kody-codereview")) continue;
+                    if (!body.trim()) continue;
+                    return { id: String(c.id), body: body.slice(0, 600) };
+                }
+                return null;
+            },
+            { timeoutSec: opts.timeoutSec ?? 300, intervalSec: 10 },
+        );
+    }
+
+    // Merges a PR (kody-issues generation fires off the closed/merged PR
+    // webhook). Falls back to a plain close if merge is not allowed (e.g.
+    // branch protection) so the issues path still gets a closed-PR event.
+    async mergePR(pr: OpenedPR): Promise<void> {
+        const resp = await http(
+            `${this.apiBase}/repos/${this.repoFullName}/pulls/${pr.number}/merge`,
+            { method: "PUT", headers: this.headers(), body: { merge_method: "squash" } },
+        );
+        if (resp.status < 200 || resp.status >= 300) {
+            log.info(
+                `github:mergePR PR#${pr.number} not mergeable (HTTP ${resp.status}) — falling back to close`,
+            );
+            await this.closePR(pr);
+        }
+    }
+
     // Return type widened from the literal "token" to the full union so
     // GitHubAppProvider (which extends this class) can override and
     // return "oauth" without TS complaining about variance — the App
@@ -510,6 +714,31 @@ export class GitHubProvider extends BaseProvider {
 
     licenseGitTool(): string {
         return "github";
+    }
+
+    async pollForLicenseBlock(
+        pr: { number: number },
+        opts: { sinceIso: string; timeoutSec?: number },
+    ): Promise<boolean> {
+        // USER_NOT_LICENSED → validate-prerequisites adds a 👎 reaction on the
+        // PR via addReactionToPR. GitHub stores 👎 as the `-1` reaction
+        // content. The 🚀 start reaction is removed when a review actually
+        // completes, so a surviving `-1` unambiguously means the seat gate
+        // blocked the review (vs. a review that ran).
+        const found = await pollUntil<boolean>(
+            async () => {
+                const resp = await http<{ content: string }[]>(
+                    `${this.apiBase}/repos/${this.repoFullName}/issues/${pr.number}/reactions?per_page=100`,
+                    { headers: this.headers() },
+                );
+                if (resp.status < 200 || resp.status >= 300) return null;
+                return (resp.body ?? []).some((r) => r.content === "-1")
+                    ? true
+                    : null;
+            },
+            { intervalSec: 5, timeoutSec: opts.timeoutSec ?? 120 },
+        );
+        return found === true;
     }
 }
 

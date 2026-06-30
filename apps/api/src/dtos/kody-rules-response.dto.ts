@@ -207,8 +207,11 @@ export class KodyRuleDto {
     @ApiProperty({ type: KodyRulesExampleDto, isArray: true, nullable: true })
     examples?: KodyRulesExampleDto[] | null;
 
-    @ApiProperty()
-    origin: string;
+    @ApiPropertyOptional({
+        description:
+            'Explicit provenance (manual, library, past_reviews, repo_file_sync, onboarding_repo_analysis, mcp_agent, cli).',
+    })
+    origin?: string;
 
     @ApiProperty()
     scope: string;
@@ -230,6 +233,12 @@ export class KodyRuleDto {
 
     @ApiProperty({ type: KodyRuleSyncErrorDto, isArray: true })
     syncErrors: KodyRuleSyncErrorDto[];
+
+    @ApiPropertyOptional({
+        description:
+            'True when the source file currently carries an `@kody-sync` marker — the per-file override that keeps the rule synced even with the repo `ideRulesSyncEnabled=false`. Surfaced so the UI can exclude such rules from the orphan chip and bulk pause/delete actions.',
+    })
+    pinnedSync?: boolean;
 }
 
 export class KodyRuleResponseDto extends ApiResponseBaseDto {
@@ -240,6 +249,30 @@ export class KodyRuleResponseDto extends ApiResponseBaseDto {
 export class KodyRulesArrayResponseDto extends ApiResponseBaseDto {
     @ApiProperty({ type: KodyRuleDto, isArray: true })
     data: KodyRuleDto[];
+}
+
+export class KodyRulesPendingCountsDto {
+    @ApiProperty()
+    total: number;
+
+    @ApiProperty()
+    rules: number;
+
+    @ApiProperty()
+    memories: number;
+}
+
+export class KodyRulesPendingDataDto {
+    @ApiProperty({ type: KodyRuleDto, isArray: true })
+    items: KodyRuleDto[];
+
+    @ApiProperty({ type: KodyRulesPendingCountsDto })
+    counts: KodyRulesPendingCountsDto;
+}
+
+export class KodyRulesPendingResponseDto extends ApiResponseBaseDto {
+    @ApiProperty({ type: KodyRulesPendingDataDto })
+    data: KodyRulesPendingDataDto;
 }
 
 export class KodyRulesFindByOrgDataDto {

@@ -10,6 +10,7 @@ import {
 } from '@libs/organization/domain/organizationParameters/contracts/organizationParameters.service.contract';
 
 import {
+    ConsumeTrialReviewCreditResult,
     ILicenseService,
     OrganizationLicenseValidationResult,
     SelfHostedLicensePayload,
@@ -201,6 +202,16 @@ export class SelfHostedLicenseService implements ILicenseService {
         }
     }
 
+    async consumeTrialReviewCredit(
+        _organizationAndTeamData: OrganizationAndTeamData,
+        _usageKey?: string,
+    ): Promise<ConsumeTrialReviewCreditResult> {
+        return {
+            allowed: true,
+            reason: 'SELF_HOSTED',
+        };
+    }
+
     private async getAssignedUsers(
         organizationAndTeamData: OrganizationAndTeamData,
     ): Promise<string[]> {
@@ -294,7 +305,9 @@ export class SelfHostedLicenseService implements ILicenseService {
             // DB lookup failed, fall through to env var
         }
 
-        // Fallback to env var
+        // Fallback to env var. KODUS_LICENSE_KEY is the customer-facing
+        // name self-hosted installs use — do NOT rename it (our test
+        // provisioning must set this exact var).
         return process.env.KODUS_LICENSE_KEY || null;
     }
 

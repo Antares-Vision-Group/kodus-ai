@@ -1,5 +1,6 @@
 import type { RunContext, Scenario } from "../lib/types.js";
 import { http } from "../lib/http.js";
+import { ensureLicenseSeat } from "../lib/onboarding.js";
 
 // Same fixture branches as code-review-basic. The diff doesn't matter
 // for the command-review path — what's under test is whether posting
@@ -26,7 +27,11 @@ export const commandReview: Scenario = {
     appliesTo: {
         target: ["cloud", "self-hosted"],
         provider: ["github", "github-app", "gitlab", "bitbucket", "azure-devops"],
-        license: ["paid", "trial", "license-paid"],
+        // `trial` dropped here for the same reason as code-review-basic: a
+        // standing trial expires after 14 days. Trial is covered by the
+        // fresh-org scenarios `trial-entitlement-gate` + `trial-managed-review`;
+        // `paid` covers the command review path.
+        license: ["paid", "license-paid"],
     },
     // Same envelope as code-review-basic: needs room for onboarding +
     // disable-auto-review setup + open PR + post-comment +
@@ -43,6 +48,9 @@ export const commandReview: Scenario = {
         await ctx.kodus.registerIntegration(session);
         const repo = await ctx.kodus.registerRepo(session);
         await ctx.kodus.finishOnboarding(session, repo);
+        // The @kody review command still runs through the prerequisites
+        // gate; on licensed self-hosted the PR author needs a seat.
+        await ensureLicenseSeat(ctx.target, session, ctx.provider);
 
         const fixture = FIXTURE_BRANCHES[ctx.provider.name];
         ctx.assert(

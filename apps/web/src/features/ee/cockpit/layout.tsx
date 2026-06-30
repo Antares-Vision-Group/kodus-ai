@@ -1,29 +1,29 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { Page } from "@components/ui/page";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@components/ui/tabs";
+import { TabsContent, TabsList, TabsTrigger } from "@components/ui/tabs";
 import { getCockpitMetricsVisibility } from "@services/organizationParameters/fetch";
 import type { CookieName } from "src/core/utils/cookie";
 import { getGlobalSelectedTeamId } from "src/core/utils/get-global-selected-team-id";
 import { greeting } from "src/core/utils/helpers";
 
 import { validateOrganizationLicense } from "../subscription/_services/billing/fetch";
+import { CockpitTabs } from "./_components/cockpit-tabs";
 import { DateRangePicker } from "./_components/date-range-picker";
 import { ExpandableCardsLayout } from "./_components/expandable-cards-layout";
 import { CockpitNoDataBanner } from "./_components/no-data-banner";
 import { RepositoryPicker } from "./_components/repository-picker";
+import { ShareViewButton } from "./_components/share-view-button";
 import { tabs, type TabValue } from "./_constants";
 import { extractApiData } from "./_helpers/api-data-extractor";
 import { isCockpitTierAllowed } from "./_helpers/tier-policy";
 import { getAnalyticsStatus } from "./_services/analytics/fetch";
-import { AnalyticsNotAvailable } from "./not-available";
 
 export default async function Layout({
     bugRatioAnalytics,
-    codeHealthByCategory,
-    codeHealthByRepository,
     deployFrequencyAnalytics,
     flowMetrics,
+    kodusReviewTab,
     leadTimeBreakdownChart,
     prCycleTimeAnalytics,
     prCycleTimeChart,
@@ -31,7 +31,6 @@ export default async function Layout({
     prSizeAnalytics,
     prsOpenedVsClosedChart,
     teamActivityChart,
-    kodySuggestionsAnalytics,
     children,
 }: React.PropsWithChildren & {
     children: React.ReactNode;
@@ -44,15 +43,17 @@ export default async function Layout({
     prsOpenedVsClosedChart: React.ReactNode;
     prsMergedByDeveloperChart: React.ReactNode;
     teamActivityChart: React.ReactNode;
-    codeHealthByCategory: React.ReactNode;
-    codeHealthByRepository: React.ReactNode;
     flowMetrics: React.ReactNode;
-    kodySuggestionsAnalytics: React.ReactNode;
+    kodusReviewTab: React.ReactNode;
 }) {
-    if (!process.env.WEB_ANALYTICS_SECRET) {
-        return <AnalyticsNotAvailable />;
-    }
-
+    // Cockpit availability is decided solely by the license tier below
+    // (`isCockpitTierAllowed`). We intentionally do NOT gate on
+    // `WEB_ANALYTICS_SECRET`: that env var is the x-api-key for the retired
+    // standalone `kodus-service-analytics` microservice, and the backend
+    // source resolver now hard-returns INTERNAL — analytics is served by the
+    // in-process Postgres warehouse via apps/api (JWT auth), which never reads
+    // that secret. Gating the page on an empty legacy secret made self-hosted
+    // Enterprise orgs see "Analytics Not Available" despite a valid license.
     const [cookieStore, selectedTeamId] = await Promise.all([
         cookies(),
         getGlobalSelectedTeamId(),
@@ -84,50 +85,50 @@ export default async function Layout({
         "cockpit-selected-repository" satisfies CookieName,
     )?.value;
 
+    // Whole-tab visibility. At least one tab is always enabled (the
+    // settings form prevents disabling both); fall back defensively.
+    const showKodusReview = metricsVisibility.tabs?.kodusReview ?? true;
+    const showProductivity = metricsVisibility.tabs?.productivity ?? true;
+    const tabsVisibility: Record<TabValue, boolean> = {
+        "flow-metrics": false, // not surfaced in the tab bar yet
+        "kodus-review": showKodusReview,
+        "productivity": showProductivity || !showKodusReview,
+    };
+    const defaultTab: TabValue = showKodusReview
+        ? "kodus-review"
+        : "productivity";
+
+    const visibleTabs = (Object.keys(tabsVisibility) as TabValue[]).filter(
+        (tab) => tabsVisibility[tab],
+    );
+
     const entries = Object.entries(tabs);
 
     return (
         <Page.Root>
             {!hasAnalyticsData && <CockpitNoDataBanner />}
 
-            <Page.Header>
+            <Page.Header className="max-w-full px-6">
                 <Page.Title>{greeting()}</Page.Title>
-                <div className="ml-auto">
+                <div className="ml-auto flex items-center gap-2">
                     <RepositoryPicker
                         cookieValue={repositoryCookieValue}
                         teamId={selectedTeamId}
                     />
+                    <DateRangePicker cookieValue={dateRangeCookieValue} />
+                    <ShareViewButton />
                 </div>
             </Page.Header>
 
-            <Page.Content>
-                <div className="grid grid-cols-3 grid-rows-2 gap-2 *:h-56">
-                    {metricsVisibility.summary.deployFrequency && (
-                        <div>{deployFrequencyAnalytics}</div>
-                    )}
-                    {metricsVisibility.summary.prCycleTime && (
-                        <div>{prCycleTimeAnalytics}</div>
-                    )}
-                    {metricsVisibility.summary.kodySuggestions && (
-                        <div>{kodySuggestionsAnalytics}</div>
-                    )}
-                    {metricsVisibility.summary.bugRatio && (
-                        <div>{bugRatioAnalytics}</div>
-                    )}
-                    {metricsVisibility.summary.prSize && (
-                        <div>{prSizeAnalytics}</div>
-                    )}
-                </div>
-
-                <div className="mt-10">
-                    <Tabs defaultValue={"productivity" satisfies TabValue}>
+            <Page.Content className="max-w-full px-6">
+                <div>
+                    <CockpitTabs
+                        defaultTab={defaultTab}
+                        visibleTabs={visibleTabs}>
                         <TabsList>
                             {/* TODO: add JIRA tab */}
                             {entries.map(([value, name]) => {
-                                if (
-                                    value ===
-                                    ("flow-metrics" satisfies TabValue)
-                                ) {
+                                if (!tabsVisibility[value as TabValue]) {
                                     return;
                                 }
 
@@ -137,20 +138,32 @@ export default async function Layout({
                                     </TabsTrigger>
                                 );
                             })}
-                            <div className="flex flex-1 justify-end">
-                                <DateRangePicker
-                                    cookieValue={dateRangeCookieValue}
-                                />
-                            </div>
                         </TabsList>
 
                         <TabsContent value={"flow-metrics" satisfies TabValue}>
                             {flowMetrics}
                         </TabsContent>
 
+                        {tabsVisibility.productivity && (
                         <TabsContent
                             forceMount
-                            value={"productivity" satisfies TabValue}>
+                            value={"productivity" satisfies TabValue}
+                            className="flex flex-col gap-2">
+                            <div className="grid grid-cols-4 gap-2 *:h-56">
+                                {metricsVisibility.summary.deployFrequency && (
+                                    <div>{deployFrequencyAnalytics}</div>
+                                )}
+                                {metricsVisibility.summary.prCycleTime && (
+                                    <div>{prCycleTimeAnalytics}</div>
+                                )}
+                                {metricsVisibility.summary.bugRatio && (
+                                    <div>{bugRatioAnalytics}</div>
+                                )}
+                                {metricsVisibility.summary.prSize && (
+                                    <div>{prSizeAnalytics}</div>
+                                )}
+                            </div>
+
                             <div className="relative grid grid-cols-2 gap-2 *:h-[500px]">
                                 <ExpandableCardsLayout>
                                     {metricsVisibility.details
@@ -173,15 +186,17 @@ export default async function Layout({
                                 )}
                             </div>
                         </TabsContent>
+                        )}
 
+                        {tabsVisibility["kodus-review"] && (
                         <TabsContent
                             forceMount
-                            value={"code-health" satisfies TabValue}
+                            value={"kodus-review" satisfies TabValue}
                             className="flex flex-col gap-6">
-                            {codeHealthByCategory}
-                            {codeHealthByRepository}
+                            {kodusReviewTab}
                         </TabsContent>
-                    </Tabs>
+                        )}
+                    </CockpitTabs>
                 </div>
 
                 {children}

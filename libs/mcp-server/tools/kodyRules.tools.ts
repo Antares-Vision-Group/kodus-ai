@@ -20,12 +20,13 @@ import {
     IKodyRule,
     IKodyRuleMemory,
     IKodyRulesExample,
-    KodyRulesOrigin,
     KodyRulesScope,
+    KodyRulesOrigin,
     KodyRulesStatus,
     KodyRulesType,
 } from '@libs/kodyRules/domain/interfaces/kodyRules.interface';
 import { buildKodyRuleCentralizedMutationRequest } from '@libs/centralized-config/utils/kody-rules-centralized-pr.builder';
+import { buildKodyRuleAppLink } from '@libs/ee/kodyRules/utils/build-rule-link';
 import { BaseResponse, McpToolDefinition } from '../types/mcp-tool.interface';
 import { wrapToolHandler } from '../utils/mcp-protocol.utils';
 
@@ -52,6 +53,9 @@ type KodyRuleInput = Required<
         | 'targetRuleUuid'
         | 'resolvedAt'
         | 'resolvedBy'
+        // MCP-created rules never come from the IDE-sync flow, so
+        // the `@kody-sync` pin doesn't apply.
+        | 'pinnedSync'
     >
 > & {
     severity: KodyRuleSeverity;
@@ -80,6 +84,7 @@ type KodyRuleMemoryInput = Required<
         | 'targetRuleUuid'
         | 'resolvedAt'
         | 'resolvedBy'
+        | 'pinnedSync'
     >
 >;
 
@@ -91,6 +96,7 @@ interface CreateKodyRuleResponse extends BaseResponse {
     data: Partial<IKodyRule>;
     message?: string;
     prUrl?: string;
+    link?: string;
 }
 
 interface CreateMemoryRuleResponse extends BaseResponse {
@@ -166,7 +172,6 @@ export class KodyRulesTools {
                             )
                             .optional(),
                         repositoryId: z.string().optional(),
-                        origin: z.enum(KodyRulesOrigin).optional(),
                         createdAt: z.iso.datetime().optional(),
                         updatedAt: z.iso.datetime().optional(),
                         reason: z.string().nullable().optional(),
@@ -249,7 +254,6 @@ export class KodyRulesTools {
                             )
                             .optional(),
                         repositoryId: z.string().optional(),
-                        origin: z.enum(KodyRulesOrigin).optional(),
                         createdAt: z.iso.datetime().optional(),
                         updatedAt: z.iso.datetime().optional(),
                         reason: z.string().nullable().optional(),
@@ -402,7 +406,7 @@ export class KodyRulesTools {
         return {
             name: 'KODUS_CREATE_KODY_RULE',
             description:
-                'Create a new Kody Rule with custom scope and severity. pull_request scope: analyzes entire PR context for PR-level rules. file scope: analyzes individual files one by one for file-level rules. Rule starts in pending status. If centralized config is enabled the rule will be published to a pull request pending to be approved.',
+                'Create a new Kody Rule with custom scope and severity. pull_request scope: analyzes entire PR context for PR-level rules. file scope: analyzes individual files one by one for file-level rules. Rule starts in pending status and must be approved in the UI before it takes effect. After execution, ALWAYS inform the user of: (1) the rule was created and is pending approval, and (2) the provided link to open the pending Kody Rules page to review and approve it. If centralized config is enabled the rule will be published to a pull request pending to be approved instead, and a prUrl is returned.',
             inputSchema,
             outputSchema: z.object({
                 success: z.boolean(),
@@ -415,6 +419,12 @@ export class KodyRulesTools {
                 }),
                 message: z.string().optional(),
                 prUrl: z.string().optional(),
+                link: z
+                    .string()
+                    .optional()
+                    .describe(
+                        'Link to the pending Kody Rules page where the rule can be reviewed and approved',
+                    ),
             }),
             execute: wrapToolHandler(
                 async (args: InputType): Promise<CreateKodyRuleResponse> => {
@@ -436,7 +446,7 @@ export class KodyRulesTools {
                             scope: args.kodyRule.scope,
                             examples: (args.kodyRule.examples ||
                                 []) as IKodyRulesExample[],
-                            origin: KodyRulesOrigin.GENERATED,
+                            origin: KodyRulesOrigin.MCP_AGENT,
                             status: KodyRulesStatus.PENDING,
                             repositoryId:
                                 args.kodyRule.repositoryId || 'global',
@@ -460,6 +470,13 @@ export class KodyRulesTools {
                         },
                     };
 
+                    const createGroupFolderName =
+                        await this.centralizedConfigPrService.resolveDirectoryGroupFolderName(
+                            params.organizationAndTeamData,
+                            params.kodyRule.repositoryId,
+                            params.kodyRule.directoryId,
+                        );
+
                     const centralizedPr =
                         await this.centralizedConfigPrService.createMutationPullRequestIfEnabled(
                             buildKodyRuleCentralizedMutationRequest({
@@ -468,6 +485,8 @@ export class KodyRulesTools {
                                 organizationAndTeamData:
                                     params.organizationAndTeamData,
                                 repositoryId: params.kodyRule.repositoryId,
+                                groupFolderName:
+                                    createGroupFolderName ?? undefined,
                                 ruleContent: params.kodyRule,
                                 ruleType: KodyRulesType.STANDARD,
                                 operation: 'create',
@@ -485,6 +504,7 @@ export class KodyRulesTools {
                             },
                             message: centralizedPr.message,
                             prUrl: centralizedPr.prUrl,
+                            link: centralizedPr.prUrl,
                         };
                     }
 
@@ -498,6 +518,20 @@ export class KodyRulesTools {
                             },
                         );
 
+                    const link = buildKodyRuleAppLink({
+                        repositoryId: result?.repositoryId,
+                        ruleId: result?.uuid,
+                        teamId: params.organizationAndTeamData.teamId,
+                        status: result?.status,
+                        tab: 'review-rules',
+                    });
+
+                    const awaitingApproval =
+                        result?.status === KodyRulesStatus.PENDING;
+                    const message = awaitingApproval
+                        ? 'Rule created and awaiting approval. Open the Kody Rules page to review and approve it.'
+                        : 'Rule created. You can open it directly from the provided link.';
+
                     return {
                         success: true,
                         count: 1,
@@ -507,6 +541,8 @@ export class KodyRulesTools {
                             rule: result?.rule,
                             status: result?.status,
                         },
+                        message,
+                        link,
                     };
                 },
             ),
@@ -615,7 +651,7 @@ export class KodyRulesTools {
         return {
             name: 'KODUS_UPDATE_KODY_RULE',
             description:
-                'Update an existing Kody Rule. Only the fields provided in kodyRule will be updated. Use this to modify rule details, change severity, scope, or status of existing rules. If centralized config is enabled the update will be published to a pull request pending to be approved.',
+                'Update an existing Kody Rule. Only the fields provided in kodyRule will be updated. Use this to modify rule details, change severity, scope, or status of existing rules. After execution, ALWAYS inform the user of the provided link to open the rule in the Kody Rules page. If centralized config is enabled the update will be published to a pull request pending to be approved instead, and a prUrl is returned.',
             inputSchema,
             outputSchema: z.object({
                 success: z.boolean(),
@@ -628,6 +664,12 @@ export class KodyRulesTools {
                 }),
                 message: z.string().optional(),
                 prUrl: z.string().optional(),
+                link: z
+                    .string()
+                    .optional()
+                    .describe(
+                        'Link to open the updated Kody Rule in the app (or the pull request URL when centralized config is enabled)',
+                    ),
             }),
             execute: wrapToolHandler(
                 async (args: InputType): Promise<CreateKodyRuleResponse> => {
@@ -646,7 +688,6 @@ export class KodyRulesTools {
                     const kodyRule: CreateKodyRuleDto = {
                         uuid: args.ruleId,
                         type: KodyRulesType.STANDARD,
-                        origin: KodyRulesOrigin.USER, // Default origin for MCP tool updates
                         ...(args.kodyRule.title && {
                             title: args.kodyRule.title,
                         }),
@@ -703,6 +744,13 @@ export class KodyRulesTools {
                             KodyRulesStatus.PENDING,
                     } as CreateKodyRuleDto;
 
+                    const updateGroupFolderName =
+                        await this.centralizedConfigPrService.resolveDirectoryGroupFolderName(
+                            organizationAndTeamData,
+                            mergedRule.repositoryId,
+                            mergedRule.directoryId,
+                        );
+
                     const centralizedPr =
                         await this.centralizedConfigPrService.createMutationPullRequestIfEnabled(
                             buildKodyRuleCentralizedMutationRequest({
@@ -710,6 +758,8 @@ export class KodyRulesTools {
                                     this.centralizedConfigPrService,
                                 organizationAndTeamData,
                                 repositoryId: mergedRule.repositoryId,
+                                groupFolderName:
+                                    updateGroupFolderName ?? undefined,
                                 ruleContent: mergedRule,
                                 ruleType: KodyRulesType.STANDARD,
                                 operation: 'update',
@@ -728,6 +778,7 @@ export class KodyRulesTools {
                             },
                             message: centralizedPr.message,
                             prUrl: centralizedPr.prUrl,
+                            link: centralizedPr.prUrl,
                         };
                     }
 
@@ -738,10 +789,20 @@ export class KodyRulesTools {
                             userInfo,
                         );
 
+                    const link = buildKodyRuleAppLink({
+                        repositoryId: result?.repositoryId,
+                        ruleId: result?.uuid,
+                        teamId: organizationAndTeamData.teamId,
+                        status: result?.status,
+                        tab: 'review-rules',
+                    });
+
                     return {
                         success: true,
                         count: 1,
                         data: result,
+                        message: 'Rule updated. You can open it directly from the provided link.',
+                        link,
                     };
                 },
             ),
@@ -900,7 +961,7 @@ export class KodyRulesTools {
                             title: args.kodyRule.title,
                             type: KodyRulesType.MEMORY,
                             rule: args.kodyRule.rule,
-                            origin: KodyRulesOrigin.GENERATED,
+                            origin: KodyRulesOrigin.MCP_AGENT,
                             status: KodyRulesStatus.ACTIVE,
                             repositoryId:
                                 args.kodyRule.repositoryId || 'global',

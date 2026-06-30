@@ -12,12 +12,16 @@ import { Page } from "@components/ui/page";
 import { toast } from "@components/ui/toaster/use-toast";
 import { ToggleGroup } from "@components/ui/toggle-group";
 import { useAsyncAction } from "@hooks/use-async-action";
-import { createOrUpdateRepositories } from "@services/codeManagement/fetch";
+import {
+    createOrUpdateRepositories,
+    deleteIntegration,
+} from "@services/codeManagement/fetch";
 import { useGetRepositories } from "@services/codeManagement/hooks";
 import {
     CODE_MANAGEMENT_API_PATHS,
     type Repository,
 } from "@services/codeManagement/types";
+import { INTEGRATION_CONFIG } from "@services/integrations/integrationConfig";
 import { fastSyncIDERules } from "@services/kodyRules/fetch";
 import { updateAutoLicenseAllowedUsers } from "@services/organizationParameters/fetch";
 import {
@@ -27,21 +31,28 @@ import {
 } from "@services/parameters/fetch";
 import { useSuspenseGetCodeReviewParameter } from "@services/parameters/hooks";
 import { ParametersConfigKey } from "@services/parameters/types";
+import { SETUP_PATHS } from "@services/setup";
 import { useSuspenseGetConnections } from "@services/setup/hooks";
 import { useQueryClient } from "@tanstack/react-query";
 import {
     AlertTriangle,
     FolderX,
     HatGlasses,
+    InfoIcon,
     KeyRound,
     PowerIcon,
     Sparkles,
 } from "lucide-react";
 import { useAuth } from "src/core/providers/auth.provider";
 import { useSelectedTeamId } from "src/core/providers/selected-team-context";
+import { IntegrationCategory } from "src/core/types";
 import { generateQueryKey } from "src/core/utils/reactQuery";
 import { safeArray } from "src/core/utils/safe-array";
 import { pluralize } from "src/core/utils/string";
+import {
+    TRIAL_DAYS,
+    TRIAL_MANAGED_REVIEW_CREDITS_INCLUDED,
+} from "src/features/ee/subscription/_constants/trial";
 
 import { StepIndicators } from "../_components/step-indicators";
 
@@ -164,6 +175,47 @@ export default function App() {
         }
     });
 
+    const [updateConnectionAction, { loading: loadingUpdateConnection }] =
+        useAsyncAction(async () => {
+            try {
+                await deleteIntegration(teamId);
+
+                await Promise.all([
+                    queryClient.invalidateQueries({
+                        queryKey: generateQueryKey(SETUP_PATHS.CONNECTIONS, {
+                            params: { teamId },
+                        }),
+                    }),
+                    queryClient.invalidateQueries({
+                        queryKey: generateQueryKey(
+                            INTEGRATION_CONFIG.GET_INTEGRATION_CONFIG_BY_CATEGORY,
+                            {
+                                params: {
+                                    teamId,
+                                    integrationCategory:
+                                        IntegrationCategory.CODE_MANAGEMENT,
+                                },
+                            },
+                        ),
+                    }),
+                    queryClient.invalidateQueries({
+                        queryKey: [
+                            CODE_MANAGEMENT_API_PATHS.GET_REPOSITORIES_ORG,
+                        ],
+                    }),
+                ]);
+
+                router.push("/setup/connecting-git-tool");
+            } catch (error) {
+                console.error(error);
+                toast({
+                    variant: "danger",
+                    title: "Could not reset the connection",
+                    description: "Please try again in a moment.",
+                });
+            }
+        });
+
     const selectedCount = selectedRepositories.length;
     const repoLabel = pluralize(selectedCount || 1, {
         singular: "repo",
@@ -188,7 +240,7 @@ export default function App() {
     });
 
     return (
-        <Page.Root className="mx-auto flex h-full min-h-[calc(100vh-4rem)] w-full flex-row overflow-hidden p-6">
+        <Page.Root className="mx-auto flex min-h-full w-full flex-row p-6">
             <div className="bg-card-lv1 flex flex-10 flex-col justify-center gap-10 rounded-3xl p-12">
                 <div className="text-text-secondary flex flex-1 flex-col justify-center gap-8 text-[15px]">
                     <div className="flex flex-col gap-4">
@@ -266,11 +318,8 @@ export default function App() {
                                     variant="primary"
                                     className="w-full"
                                     rightIcon={<KeyRound />}
-                                    onClick={() =>
-                                        router.push(
-                                            "/setup/connecting-git-tool",
-                                        )
-                                    }>
+                                    loading={loadingUpdateConnection}
+                                    onClick={updateConnectionAction}>
                                     Update connection
                                 </Button>
                                 <p className="text-text-tertiary text-center text-xs">
@@ -293,6 +342,28 @@ export default function App() {
                             </div>
 
                             <div className="flex flex-col gap-4">
+                                <Alert variant="info">
+                                    <InfoIcon />
+                                    <AlertTitle>
+                                        Your first{" "}
+                                        {TRIAL_MANAGED_REVIEW_CREDITS_INCLUDED}{" "}
+                                        PR reviews are on us
+                                    </AlertTitle>
+                                    <AlertDescription>
+                                        <p>
+                                            During your {TRIAL_DAYS}-day trial
+                                            we cover your first{" "}
+                                            {
+                                                TRIAL_MANAGED_REVIEW_CREDITS_INCLUDED
+                                            }{" "}
+                                            PR reviews — no AI key needed. After
+                                            that, connect your AI key for
+                                            unlimited reviews (free, on any
+                                            plan).
+                                        </p>
+                                    </AlertDescription>
+                                </Alert>
+
                                 <FormControl.Root>
                                     <FormControl.Label htmlFor="select-repositories">
                                         Select repositories

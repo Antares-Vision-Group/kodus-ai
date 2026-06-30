@@ -2,8 +2,8 @@
 # Destroys a persistent self-hosted dev stack provisioned via provision.sh.
 #
 # Usage:
-#   yarn selfhosted:destroy                   # destroys default instance
-#   yarn selfhosted:destroy --name wellington # named instance
+#   pnpm run selfhosted:destroy                   # destroys default instance
+#   pnpm run selfhosted:destroy --name wellington # named instance
 
 set -euo pipefail
 
@@ -68,14 +68,46 @@ require_provider_token() {
     err ""
     err "Fix options:"
     err "  1) Save it once in your global config:"
-    err "       yarn selfhosted:setup"
+    err "       pnpm run selfhosted:setup"
     err "  2) Or pass it inline for this run:"
-    err "       $var=<your-token> yarn selfhosted:destroy${NAME:+ --name $NAME}"
+    err "       $var=<your-token> pnpm run selfhosted:destroy${NAME:+ --name $NAME}"
     err ""
     err "The droplet (id=$SERVER_ID, ip=$SERVER_IP) is still alive."
     err "You can also delete it manually at the provider's console."
     exit 1
 }
+
+# ---------- HARD SAFETY GUARD ----------
+# Never delete a droplet that isn't one of OUR test droplets. provision.sh
+# always names them "kodus-selfhosted-<name>", so before issuing the DELETE
+# (which is keyed on SERVER_ID from the state file) we re-read the droplet's
+# LIVE name from the provider and refuse anything that doesn't match. This
+# protects production resources (e.g. kodus-web-new) from a stale/wrong
+# SERVER_ID in a state file or any future tooling bug. Fail-closed: if we
+# can't read the name, we don't delete.
+EXPECTED_NAME_PREFIX="kodus-selfhosted-"
+if [ "$PROVIDER" = "digitalocean" ]; then
+    require_provider_token DIGITALOCEAN_TOKEN
+    LIVE_NAME=$(curl -fsS \
+        -H "Authorization: Bearer ${DIGITALOCEAN_TOKEN}" \
+        "https://api.digitalocean.com/v2/droplets/$SERVER_ID" 2>/dev/null \
+        | jq -r '.droplet.name // ""' 2>/dev/null || echo "")
+    if [ -z "$LIVE_NAME" ]; then
+        err "SAFETY: could not read droplet $SERVER_ID's name from DigitalOcean"
+        err "to confirm it's a '${EXPECTED_NAME_PREFIX}*' test droplet. Refusing to"
+        err "delete an unverified droplet. Check cloud.digitalocean.com manually."
+        exit 1
+    fi
+    case "$LIVE_NAME" in
+        "${EXPECTED_NAME_PREFIX}"*) : ;;  # ours — safe to destroy
+        *)
+            err "SAFETY: refusing to delete droplet $SERVER_ID — its live name is"
+            err "'$LIVE_NAME', which is NOT a '${EXPECTED_NAME_PREFIX}*' test droplet."
+            err "Aborting to protect production resources (e.g. kodus-web-new)."
+            exit 1
+            ;;
+    esac
+fi
 
 # ---------- destroy server ----------
 case "$PROVIDER" in

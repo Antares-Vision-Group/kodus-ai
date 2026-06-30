@@ -22,16 +22,19 @@ import { isFileMatchingGlob } from '@libs/common/utils/glob-utils';
 import { assignFileTiers, computeFileScores } from './llm/file-priority-scorer';
 import { byokToVercelModel, getModelName } from './llm/byok-to-vercel';
 import { resolveContextWindow } from './llm/model-context-window';
+import { AgentContextWindowTooSmallError } from './llm/errors';
+import type { ReviewWarning } from './llm/review-warnings';
+import {
+    resolveAdaptiveProfile,
+    type AdaptiveProfile,
+} from './llm/adaptive-fit';
 import {
     runAgentLoop,
     type AgentLoopSecrets,
     type VerificationTraceSummary,
     type AgentAnomalySummary,
 } from './llm/agent-loop';
-import {
-    propagateAttributes,
-    startActiveObservation,
-} from '@langfuse/tracing';
+import { propagateAttributes, startActiveObservation } from '@langfuse/tracing';
 import { shouldTrace } from '@libs/core/log/langfuse';
 import {
     CoverageSummary,
@@ -66,6 +69,27 @@ const PROMPT_BUDGET_RATIO = 0.55;
  * to reduce the per-chunk diff budget when we split.
  */
 const PROMPT_STATIC_OVERHEAD_CHARS = 62_000;
+/**
+ * Static overhead when the compact prompt path fires (adaptive-fit
+ * `compact+` profiles). Measured empirically from the post-fix benchmark:
+ * the compact system + user prompt strings drop ~14K chars (saving
+ * ~3.5K tokens of the system prompt + the OutputFormat block + the
+ * trimmed Rules). The 40K-char tool-schema block is untouched (we
+ * deliberately don't reduce the toolset). 62K - 14K = 48K chars ≈ 12K
+ * tokens of overhead, which gives 16K models ~4K of headroom for diffs.
+ */
+const PROMPT_STATIC_OVERHEAD_CHARS_COMPACT = 48_000;
+
+/**
+ * Operational cross-file anchoring rule appended to every <Scope> block. Without
+ * it the model anchors cross-file findings on the UNCHANGED symptom file or a
+ * placeholder path, and they get dropped at the @@PATH_MISMATCH@@ filter (the
+ * relevantFile-not-in-changedFiles drop) before reaching Mongo. This keeps the
+ * anchor on the changed trigger line so verify-kept findings survive.
+ */
+const SCOPE_CROSS_FILE_EXTRA = `
+    CROSS-FILE: when the bug spans files, set relevantFile/relevantLinesStart/relevantLinesEnd to the CHANGED line that TRIGGERS it (the modified call, usage, import, or signature) — NOT the unchanged file where the symptom surfaces — and explain the cross-file effect in suggestionContent.
+    NEVER emit a placeholder, guessed, "unknown", or non-diff path for relevantFile. If you cannot anchor the finding to a specific changed line present in this diff, OMIT the finding entirely.`;
 
 /**
  * Low-signal glob patterns dropped from changedFiles only when a large PR
@@ -83,6 +107,38 @@ const LARGE_PR_AGGRESSIVE_FILTER_PATTERNS = [
     '**/*.css',
     '**/*.scss',
 ];
+
+/**
+ * Preflight guard: when the agent's static overhead (system prompt +
+ * tool schemas + coverage list + PR context) already exceeds the
+ * model's context window, no PR can ever fit and the LLM call would
+ * fail immediately with a 4xx. Without this check the agent silently
+ * hangs until AGENT_TIMEOUT_MS (30 min) — see runAgentLoop's setTimeout
+ * — burning a queue slot and producing zero output.
+ *
+ * Exported so it can be unit-tested in isolation. Called from
+ * BaseCodeReviewAgentProvider.execute right after resolveContextWindow.
+ */
+export function assertContextWindowFitsOverhead(params: {
+    input: {
+        changedFiles?: FileChange[];
+        callGraph?: string;
+        prTitle?: string;
+        prBody?: string;
+        adaptiveProfile?: AdaptiveProfile;
+    };
+    contextWindow: number;
+    modelName: string;
+}): void {
+    const overheadTokens = estimateNonDiffOverheadTokens(params.input);
+    if (overheadTokens >= params.contextWindow) {
+        throw new AgentContextWindowTooSmallError({
+            contextWindow: params.contextWindow,
+            overheadTokens,
+            modelName: params.modelName,
+        });
+    }
+}
 
 function estimateDiffTokens(files: FileChange[]): number {
     return files.reduce((sum, f) => {
@@ -104,17 +160,31 @@ function estimateNonDiffOverheadTokens(input: {
     callGraph?: string;
     prTitle?: string;
     prBody?: string;
+    adaptiveProfile?: AdaptiveProfile;
 }): number {
-    const callGraphChars = (input.callGraph || '').length;
+    // Adaptive fit: when the compact prompt path will fire, the system
+    // + user prompt are ~14K chars smaller. Counting the full 62K
+    // overhead would cause the preflight to throw before the compact
+    // path even has a chance to render — exactly the bug observed on
+    // the post-fix 16K benchmark run where every PR preflight-failed
+    // despite the strategies being wired correctly.
+    const staticOverheadChars = input.adaptiveProfile?.compactPrompt
+        ? PROMPT_STATIC_OVERHEAD_CHARS_COMPACT
+        : PROMPT_STATIC_OVERHEAD_CHARS;
+    // CallGraph: if the profile drops it from the prompt, the estimator
+    // must drop it too. Otherwise the preflight blames overhead the
+    // user will never actually pay.
+    const callGraphChars = input.adaptiveProfile?.dropCallGraph
+        ? 0
+        : (input.callGraph || '').length;
     const prBodyChars = Math.min((input.prBody || '').length, 500);
-    const prContextChars =
-        300 + (input.prTitle || '').length + prBodyChars;
+    const prContextChars = 300 + (input.prTitle || '').length + prBodyChars;
     const coverageListChars = (input.changedFiles?.length || 0) * 80;
     const totalChars =
         callGraphChars +
         prContextChars +
         coverageListChars +
-        PROMPT_STATIC_OVERHEAD_CHARS;
+        staticOverheadChars;
     return Math.ceil(totalChars / CHARS_PER_TOKEN);
 }
 
@@ -129,6 +199,7 @@ function estimatePromptTokens(input: {
     prTitle?: string;
     prBody?: string;
     fileTiers?: Map<string, CoverageTier>;
+    adaptiveProfile?: AdaptiveProfile;
 }): number {
     const tiers = input.fileTiers;
     const diffChars = (input.changedFiles || []).reduce((sum, f) => {
@@ -152,6 +223,51 @@ function estimatePromptTokens(input: {
 function normalizeFilenameForTier(filename?: string): string {
     if (!filename) return '';
     return filename.replace(/^\/+/, '').replace(/\\/g, '/').trim();
+}
+
+// Bounded Levenshtein distance — returns early once it exceeds `max`.
+// Used to recover a kody_rules ruleUuid the LLM corrupted while echoing
+// it (LLMs occasionally drop/transpose a character in a 36-char UUID).
+function boundedEditDistance(a: string, b: string, max: number): number {
+    if (Math.abs(a.length - b.length) > max) return max + 1;
+    let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+        const curr = [i];
+        let rowMin = i;
+        for (let j = 1; j <= b.length; j++) {
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+            const v = Math.min(
+                prev[j] + 1,
+                curr[j - 1] + 1,
+                prev[j - 1] + cost,
+            );
+            curr.push(v);
+            if (v < rowMin) rowMin = v;
+        }
+        if (rowMin > max) return max + 1; // whole row already over budget
+        prev = curr;
+    }
+    return prev[b.length];
+}
+
+// Recover the intended rule when the LLM-emitted `ruleUuid` is not an
+// exact key but is within a tiny edit distance of EXACTLY ONE known rule.
+// UUIDs don't collide within distance 2, and the per-PR rule set is small,
+// so a unique near-match is an unambiguous recovery; ambiguity (0 or >1
+// matches) returns null so the caller drops the suggestion. See #1170.
+export function recoverRuleUuid(
+    emitted: string,
+    knownUuids: Iterable<string>,
+): string | null {
+    const MAX_DISTANCE = 2;
+    let match: string | null = null;
+    for (const known of knownUuids) {
+        if (boundedEditDistance(emitted, known, MAX_DISTANCE) <= MAX_DISTANCE) {
+            if (match) return null; // more than one near-match → ambiguous
+            match = known;
+        }
+    }
+    return match;
 }
 
 function estimateHunkHeaderChars(diff: string): number {
@@ -344,6 +460,14 @@ export interface ReviewAgentInput {
      *  tiered coverage is active. Safe to omit — the scorer falls back to
      *  a neutral structural weight of 1.0 when missing. */
     callGraphJson?: { nodes: unknown[]; edges: unknown[] };
+    /**
+     * When the caller has no BYOK config (e.g. the public-demo / trial
+     * flow with `organizationId='trial'`), this overrides the hardcoded
+     * gemini-3.1-pro default that `byokToVercelModel` falls back to.
+     * Used by the trial pipeline to force a cheaper, faster model
+     * (`gemini-2.5-flash`) so anonymous reviews don't take 5 minutes.
+     */
+    defaultModelOverride?: string;
     /** Internal: populated by the large-PR non-deep branch of execute().
      *  Downstream consumers (buildUserPrompt, runAgentLoop) switch the
      *  coverage ledger into tiered mode when this is set. Maps each
@@ -380,6 +504,15 @@ export interface ReviewAgentInput {
      *  but produces duplicate comments for explicit-rule agents like
      *  kody-rules. */
     skipSynthesisRescue?: boolean;
+    /**
+     * Optional adaptive-fit profile resolved upstream (by the stage) from
+     * the same BYOK config and model the agent will use. When present,
+     * per-agent code paths read these flags instead of re-resolving the
+     * profile locally — guarantees the stage's gating decisions (drop
+     * callGraph, skip heavy passes) and the provider's behaviour
+     * (compact prompt, all-optional, diff truncation) agree.
+     */
+    adaptiveProfile?: AdaptiveProfile;
     /** Categories allowed for this run when using a mixed/generalist reviewer. */
     requestedCategories?: Array<'bug' | 'security' | 'performance'>;
     /** Parent (job-level) AbortSignal. Forwarded to runAgentLoop so the
@@ -407,6 +540,10 @@ export interface ReviewAgentOutput {
     agentReplicaTotal?: number;
     turnsUsed: number;
     durationMs: number;
+    /** Fidelity warnings emitted by this agent's loop (small context window
+     *  forced compact prompt, dropped callGraph, etc). Empty when no
+     *  adaptive strategy fired. */
+    warnings?: ReviewWarning[];
 }
 
 /**
@@ -550,9 +687,17 @@ export abstract class BaseCodeReviewAgentProvider {
             };
         }
 
-        // Create Vercel AI SDK model from BYOK config
-        const model = byokToVercelModel(byokConfig);
-        const modelName = getModelName(byokConfig);
+        // Create Vercel AI SDK model from BYOK config. The
+        // defaultModelOverride kicks in only when byokConfig is null and the
+        // caller (e.g. the trial pipeline) asked for a specific default —
+        // production BYOK flows are untouched.
+        const model = byokToVercelModel(
+            byokConfig,
+            'main',
+            {},
+            input.defaultModelOverride,
+        );
+        const modelName = getModelName(byokConfig, input.defaultModelOverride);
 
         this.agentLogger.log({
             message: `[AGENT] ${identity.name} using model: ${modelName}`,
@@ -567,7 +712,86 @@ export abstract class BaseCodeReviewAgentProvider {
             byokMaxInputTokens: byokConfig?.main?.maxInputTokens,
             modelName,
         });
+        // Resolve adaptive-fit profile from the same context window the
+        // preflight will check against. Prefer the stage-supplied profile
+        // when present (it's authoritative — the stage owns callGraph and
+        // skipHeavyPasses decisions and we need to agree). Falling back
+        // to local resolution covers callers (CLI trial, ad-hoc tests)
+        // that didn't go through the stage.
+        const adaptiveProfile =
+            input.adaptiveProfile ?? resolveAdaptiveProfile(contextWindow);
+        // Ensure downstream estimators (estimateNonDiffOverheadTokens,
+        // estimatePromptTokens, the prompt builders) all see the same
+        // profile — without this the preflight would be computing the
+        // FULL overhead even when the compact path will fire, throwing
+        // before the strategies could rescue the run (the exact failure
+        // mode caught by the first post-fix benchmark).
+        if (!input.adaptiveProfile) {
+            input = { ...input, adaptiveProfile };
+        }
+        // Track which adaptive strategies fired so they bubble up to the
+        // orchestrator as ReviewWarning entries → end-review PR comment.
+        const agentWarnings: ReviewWarning[] = [];
+        const emitWarning = (
+            kind: ReviewWarning['kind'],
+            detail?: string,
+        ) => {
+            agentWarnings.push({
+                kind,
+                reason: 'small_context_window',
+                contextWindowTokens: contextWindow,
+                modelName,
+                detail,
+                agentName: identity.name,
+            });
+        };
+        // Fail fast when the configured model's context window cannot
+        // even hold the agent's static overhead. Without this, the loop
+        // would run to AGENT_TIMEOUT_MS (30 min) while the LLM 400s on
+        // every retry — see runAgentLoop. Surfaces as CONTEXT_OVERFLOW
+        // via classifyLLMError → friendlyMessage on lastReviewError.
+        assertContextWindowFitsOverhead({
+            input,
+            contextWindow,
+            modelName,
+        });
+        if (adaptiveProfile.compactPrompt) {
+            emitWarning('PROMPT_COMPACTED');
+        }
         const promptBudget = Math.floor(contextWindow * PROMPT_BUDGET_RATIO);
+        // Adaptive fit: when the profile says so, truncate per-file
+        // diffs before estimating tokens. Each truncated file gets a
+        // marker so the agent knows context is missing. Skipped when
+        // the file already fits under the cap (no behavior change).
+        if (adaptiveProfile.maxDiffChars && input.changedFiles?.length) {
+            const cap = adaptiveProfile.maxDiffChars;
+            const truncatedNames: string[] = [];
+            const truncatedFiles = input.changedFiles.map((f) => {
+                const diff = f.patchWithLinesStr ?? f.patch ?? '';
+                if (diff.length <= cap) return f;
+                truncatedNames.push(f.filename ?? 'unknown');
+                const head = diff.slice(0, cap);
+                const marker = `\n... (diff truncated to ${cap} chars by adaptive-fit; readFile for the rest)`;
+                return f.patchWithLinesStr
+                    ? { ...f, patchWithLinesStr: head + marker }
+                    : { ...f, patch: head + marker };
+            });
+            if (truncatedNames.length > 0) {
+                input = { ...input, changedFiles: truncatedFiles };
+                this.agentLogger.log({
+                    message: `[AGENT] ${identity.name} adaptive-fit: truncated ${truncatedNames.length} long diffs to ${cap} chars`,
+                    context: identity.name,
+                    metadata: {
+                        truncatedFiles: truncatedNames,
+                        maxDiffChars: cap,
+                    },
+                });
+                emitWarning(
+                    'DIFF_TRUNCATED',
+                    `${truncatedNames.length} files truncated to ${cap} chars`,
+                );
+            }
+        }
         let estimatedPromptTokens = estimatePromptTokens(input);
 
         // Large-PR aggressive filter + priority tiering: when the estimated
@@ -577,12 +801,18 @@ export abstract class BaseCodeReviewAgentProvider {
         // coverage relax from "inspect every file" to "inspect criticals
         // + 70% total", which is what actually keeps the main loop from
         // burning steps on UI leaves in a huge PR.
+        //
+        // Adaptive fit (`compact+`): drop the `reviewMode !== 'deep'`
+        // gate AND the prompt-overflow gate so the low-signal filter
+        // always fires on small windows. Deep-mode small-window reviews
+        // are still better than no review at all.
         let fileTiers: Map<string, CoverageTier> | undefined;
-        if (
-            estimatedPromptTokens > promptBudget &&
+        const shouldFireFilter =
             input.changedFiles.length > 1 &&
-            input.reviewMode !== 'deep'
-        ) {
+            (adaptiveProfile.lowSignalFilterUnconditional ||
+                (estimatedPromptTokens > promptBudget &&
+                    input.reviewMode !== 'deep'));
+        if (shouldFireFilter) {
             const filesBefore = input.changedFiles.length;
             const filteredFiles = applyLargePrAggressiveFilter(
                 input.changedFiles,
@@ -601,6 +831,12 @@ export abstract class BaseCodeReviewAgentProvider {
                         reviewMode: input.reviewMode,
                     },
                 });
+                if (adaptiveProfile.lowSignalFilterUnconditional) {
+                    emitWarning(
+                        'LOW_SIGNAL_FILES_DROPPED',
+                        `${filesBefore - filteredFiles.length} files dropped (tests/md/css)`,
+                    );
+                }
             }
 
             const scores = computeFileScores(
@@ -608,6 +844,17 @@ export abstract class BaseCodeReviewAgentProvider {
                 input.callGraphJson,
             );
             fileTiers = assignFileTiers(scores);
+            // Adaptive fit (`minimal`): force every file to `optional`
+            // so the user prompt renders hunk-headers only (cutting
+            // ~80–90% of diff chars). The agent must readFile each hunk
+            // it cares about — slower per-finding but the only way to
+            // squeeze a multi-file PR into an 8K–16K window.
+            if (adaptiveProfile.allOptional) {
+                for (const filename of fileTiers.keys()) {
+                    fileTiers.set(filename, 'optional');
+                }
+                emitWarning('HUNK_HEADERS_ONLY');
+            }
             let criticalCount = 0;
             let warmCount = 0;
             let optionalCount = 0;
@@ -657,6 +904,43 @@ export abstract class BaseCodeReviewAgentProvider {
                 promptBudget - overheadTokens,
                 Math.floor(contextWindow * 0.3),
             );
+            // Pre-check the chunker BEFORE recursing: if it would
+            // produce a single chunk containing every file (small files
+            // packing comfortably), splitting won't help — the prompt
+            // overflow is from the overhead, not the diffs. Falling
+            // through to runAgentLoop on the same stack frame lets the
+            // agent loop's mid-stream compressor handle marginal
+            // overflow, and the assertPromptFitsInContext preflight
+            // catches the genuine "won't fit at all" case. Without this
+            // check, executeChunked would recurse → execute() at depth 1
+            // → same chunking decision → infinite recursion bounded by
+            // MAX_RECURSION_DEPTH = an opaque user-facing failure.
+            const previewChunks = chunkFilesByTokenBudget(
+                input.changedFiles,
+                chunkDiffBudget,
+            );
+            if (
+                previewChunks.length === 1 &&
+                previewChunks[0].length === input.changedFiles.length
+            ) {
+                this.agentLogger.log({
+                    message: `[AGENT] ${identity.name} chunker would return 1 chunk for ${input.changedFiles.length} files; running single batch directly (overhead, not diff size, is the constraint)`,
+                    context: identity.name,
+                    metadata: {
+                        prNumber: input.prNumber,
+                        filesCount: input.changedFiles.length,
+                        overheadTokens,
+                        chunkDiffBudget,
+                        estimatedPromptTokens,
+                        promptBudget,
+                    },
+                });
+                // Fall through to the single-batch runAgentLoop path
+                // below by NOT entering executeChunked. The variables
+                // (estimatedPromptTokens, fileTiers, etc) are already
+                // set and runAgentLoop's own preflight + compressor
+                // will handle the rest.
+            } else {
             this.agentLogger.warn({
                 message: `[AGENT] ${identity.name} prompt exceeds context budget (${estimatedPromptTokens} tokens > ${promptBudget} budget), splitting into batches`,
                 context: identity.name,
@@ -677,7 +961,15 @@ export abstract class BaseCodeReviewAgentProvider {
                 modelName,
                 startTime,
                 diffBudget: chunkDiffBudget,
+                // Parent-level warnings emitted before the chunk split
+                // (PROMPT_COMPACTED, DIFF_TRUNCATED, LOW_SIGNAL_FILES_DROPPED,
+                // HUNK_HEADERS_ONLY) — forward so they're preserved in the
+                // final aggregate. Each per-batch execute() resolves the
+                // profile again and may emit additional dedup-able copies;
+                // dedupReviewWarnings in the orchestrator folds them.
+                parentWarnings: agentWarnings,
             });
+            } // end else (multi-chunk path)
         }
 
         const systemPrompt = this.buildSystemPrompt(input);
@@ -817,7 +1109,7 @@ export abstract class BaseCodeReviewAgentProvider {
                     {
                         traceName: identity.name,
                         sessionId: input.prNumber
-                            ? String(input.prNumber)
+                            ? `${orgId ?? 'org'}:${input.repositoryId ?? 'repo'}:${input.prNumber}`
                             : undefined,
                         userId: orgId,
                         metadata: traceMetadata,
@@ -829,10 +1121,8 @@ export abstract class BaseCodeReviewAgentProvider {
                                 // Strip redundant `patch` from changedFiles —
                                 // `patchWithLinesStr` already carries the same content
                                 // with line numbers added.
-                                const {
-                                    changedFiles,
-                                    ...restParams
-                                } = loopParams as any;
+                                const { changedFiles, ...restParams } =
+                                    loopParams as any;
                                 const safeInput = {
                                     ...restParams,
                                     ...(changedFiles && {
@@ -997,20 +1287,45 @@ export abstract class BaseCodeReviewAgentProvider {
                         });
                         return false;
                     }
-                    if (!kodyRulesByUuid.has(ruleUuid)) {
-                        this.agentLogger.warn({
-                            message: `[AGENT] Dropping kody_rules suggestion with unknown ruleUuid=${ruleUuid}: "${(s.oneSentenceSummary || s.suggestionContent).slice(0, 140)}"`,
-                            context: this.getIdentity().name,
-                            metadata: {
-                                prNumber: input.prNumber,
-                                ruleUuid,
-                                knownRuleCount: kodyRulesByUuid.size,
-                            },
-                        });
-                        return false;
+                    let resolvedRuleUuid = ruleUuid;
+                    if (!kodyRulesByUuid.has(resolvedRuleUuid)) {
+                        // LLMs occasionally corrupt a character when echoing
+                        // the 36-char UUID (observed: a dropped digit), which
+                        // would discard an otherwise-correct finding. Recover
+                        // only when it maps unambiguously to one known rule.
+                        const recovered = recoverRuleUuid(
+                            resolvedRuleUuid,
+                            kodyRulesByUuid.keys(),
+                        );
+                        if (recovered) {
+                            this.agentLogger.warn({
+                                message: `[AGENT] Recovered corrupted kody_rules ruleUuid=${resolvedRuleUuid} → ${recovered} (LLM UUID echo drift)`,
+                                context: this.getIdentity().name,
+                                metadata: { prNumber: input.prNumber },
+                            });
+                            // Normalize so downstream rule-link rendering uses
+                            // the real UUID.
+                            resolvedRuleUuid = recovered;
+                            s.ruleUuid = recovered;
+                        } else {
+                            this.agentLogger.warn({
+                                message: `[AGENT] Dropping kody_rules suggestion with unknown ruleUuid=${resolvedRuleUuid}: "${(s.oneSentenceSummary || s.suggestionContent).slice(0, 140)}"`,
+                                context: this.getIdentity().name,
+                                metadata: {
+                                    prNumber: input.prNumber,
+                                    ruleUuid: resolvedRuleUuid,
+                                    knownRuleCount: kodyRulesByUuid.size,
+                                },
+                            });
+                            return false;
+                        }
                     }
                     // PR-level kody_rules omit relevantFile by design.
-                    const kodyRulePathMatch = !s.relevantFile || validFilesByNormalized.has(normalizeRepoPath(s.relevantFile));
+                    const kodyRulePathMatch =
+                        !s.relevantFile ||
+                        validFilesByNormalized.has(
+                            normalizeRepoPath(s.relevantFile),
+                        );
                     if (!kodyRulePathMatch) {
                         this.agentLogger.warn({
                             message: `@@PATH_MISMATCH@@ Dropping kody_rules suggestion — relevantFile not in changedFiles after normalization`,
@@ -1018,16 +1333,28 @@ export abstract class BaseCodeReviewAgentProvider {
                             metadata: {
                                 prNumber: input.prNumber,
                                 relevantFile: s.relevantFile,
-                                normalizedRelevantFile: normalizeRepoPath(s.relevantFile),
-                                changedFiles: [...validFilesByNormalized.values()],
-                                suggestionPreview: (s.oneSentenceSummary || s.suggestionContent || '').slice(0, 140),
+                                normalizedRelevantFile: normalizeRepoPath(
+                                    s.relevantFile,
+                                ),
+                                changedFiles: [
+                                    ...validFilesByNormalized.values(),
+                                ],
+                                suggestionPreview: (
+                                    s.oneSentenceSummary ||
+                                    s.suggestionContent ||
+                                    ''
+                                ).slice(0, 140),
                             },
                         });
                     }
                     return kodyRulePathMatch;
                 }
 
-                const pathMatch = !!s.relevantFile && validFilesByNormalized.has(normalizeRepoPath(s.relevantFile));
+                const pathMatch =
+                    !!s.relevantFile &&
+                    validFilesByNormalized.has(
+                        normalizeRepoPath(s.relevantFile),
+                    );
                 if (!pathMatch && s.relevantFile) {
                     this.agentLogger.warn({
                         message: `@@PATH_MISMATCH@@ Dropping suggestion — relevantFile not in changedFiles after normalization`,
@@ -1035,10 +1362,16 @@ export abstract class BaseCodeReviewAgentProvider {
                         metadata: {
                             prNumber: input.prNumber,
                             relevantFile: s.relevantFile,
-                            normalizedRelevantFile: normalizeRepoPath(s.relevantFile),
+                            normalizedRelevantFile: normalizeRepoPath(
+                                s.relevantFile,
+                            ),
                             changedFiles: [...validFilesByNormalized.values()],
                             severity: s.severity,
-                            suggestionPreview: (s.oneSentenceSummary || s.suggestionContent || '').slice(0, 140),
+                            suggestionPreview: (
+                                s.oneSentenceSummary ||
+                                s.suggestionContent ||
+                                ''
+                            ).slice(0, 140),
                         },
                     });
                 }
@@ -1055,9 +1388,9 @@ export abstract class BaseCodeReviewAgentProvider {
                 // exact path shape the provider expects (e.g. Azure requires
                 // the leading slash it returns from its API).
                 const canonicalRelevantFile = s.relevantFile
-                    ? validFilesByNormalized.get(
+                    ? (validFilesByNormalized.get(
                           normalizeRepoPath(s.relevantFile),
-                      ) ?? s.relevantFile
+                      ) ?? s.relevantFile)
                     : s.relevantFile;
 
                 return {
@@ -1192,6 +1525,13 @@ export abstract class BaseCodeReviewAgentProvider {
                 agentReplicaTotal: input.agentReplicaTotal,
                 turnsUsed: agentResult.steps,
                 durationMs,
+                // Merge agent-loop-emitted warnings (currently none — the
+                // loop's warnings: [] is the PR1 placeholder) with the
+                // strategy warnings emitted in this provider above.
+                warnings: [
+                    ...agentWarnings,
+                    ...(agentResult.warnings ?? []),
+                ],
             };
         } catch (error) {
             const durationMs = Date.now() - startTime;
@@ -1247,6 +1587,7 @@ export abstract class BaseCodeReviewAgentProvider {
             modelName: string;
             startTime: number;
             diffBudget: number;
+            parentWarnings?: ReviewWarning[];
         },
     ): Promise<ReviewAgentOutput> {
         const {
@@ -1257,23 +1598,28 @@ export abstract class BaseCodeReviewAgentProvider {
             modelName,
             startTime,
             diffBudget,
+            parentWarnings,
         } = ctx;
         const chunks = chunkFilesByTokenBudget(input.changedFiles, diffBudget);
 
-        // Fail-fast on useless chunking: when chunkFilesByTokenBudget cannot
-        // reduce the file count (one chunk containing every input file), the
-        // prompt overhead — not the diff size — is what's blowing the budget.
-        // Recursing back into execute() with the same file set would just
-        // re-fire the same gate forever (the historical worker-OOM loop).
-        // Aborting here surfaces the real cause in the orchestrator's
-        // failures[] instead of silently exhausting the worker heap.
+        // Defense-in-depth: the chunker may pack small files together
+        // into a single chunk (all files individually fit comfortably).
+        // The execute() pre-check above already detects this case and
+        // skips executeChunked, but if a caller bypassed the pre-check
+        // we still don't want to recurse — that would re-enter execute()
+        // with the same files at depth+1, trigger the same chunking
+        // decision, and hit MAX_RECURSION_DEPTH with an opaque error.
+        // Instead, just log and proceed; the inner agent loop's
+        // assertPromptFitsInContext preflight is the real gate when the
+        // prompt won't fit, and its mid-stream compressor handles
+        // marginal overflow.
         if (
             chunks.length === 1 &&
             chunks[0].length === input.changedFiles.length &&
             input.changedFiles.length > 1
         ) {
-            this.agentLogger.error({
-                message: `[AGENT] ${identity.name} chunking did not reduce file count (${input.changedFiles.length} files in 1 chunk); static prompt overhead exceeds budget on its own — aborting before recursion`,
+            this.agentLogger.log({
+                message: `[AGENT] ${identity.name} chunker returned 1 chunk for ${input.changedFiles.length} files (files pack comfortably); proceeding as single batch`,
                 context: identity.name,
                 metadata: {
                     prNumber: input.prNumber,
@@ -1281,7 +1627,6 @@ export abstract class BaseCodeReviewAgentProvider {
                     diffBudget,
                 },
             });
-            throw new Error('AGENT_PROMPT_OVERHEAD_EXCEEDS_BUDGET');
         }
 
         this.agentLogger.log({
@@ -1299,7 +1644,16 @@ export abstract class BaseCodeReviewAgentProvider {
         const allSuggestions: Partial<CodeSuggestion>[] = [];
         const allDiscardedBySeverity: Partial<CodeSuggestion>[] = [];
         const allDiscardedByVerify: Partial<CodeSuggestion>[] = [];
+        // Seed aggregate warnings with the parent-level entries so the
+        // chunker doesn't lose PROMPT_COMPACTED / DIFF_TRUNCATED etc.
+        const allWarnings: ReviewWarning[] = [...(parentWarnings ?? [])];
         let totalTurns = 0;
+        // Track per-batch failures so a totally-failed chunked run can
+        // surface as an orchestrator failure instead of silently
+        // returning empty findings (a pre-fix benchmark caught this:
+        // every batch threw AGENT_PROMPT_OVERHEAD_EXCEEDS_BUDGET and the
+        // user got "review completed, 0 findings" with no signal).
+        const batchErrors: Error[] = [];
 
         const batchTotal = chunks.length;
 
@@ -1360,6 +1714,9 @@ export abstract class BaseCodeReviewAgentProvider {
                 if (batchResult.discardedByVerify) {
                     allDiscardedByVerify.push(...batchResult.discardedByVerify);
                 }
+                if (batchResult.warnings?.length) {
+                    allWarnings.push(...batchResult.warnings);
+                }
                 totalTurns += batchResult.turnsUsed;
 
                 this.agentLogger.log({
@@ -1402,7 +1759,33 @@ export abstract class BaseCodeReviewAgentProvider {
                     errorMessage: errMsg.substring(0, 500),
                     errorName: errName,
                 });
+
+                batchErrors.push(
+                    error instanceof Error ? error : new Error(errMsg),
+                );
             }
+        }
+
+        // When every batch failed, propagate the first batch's error so
+        // the orchestrator records the agent as failed (failures[]) and
+        // the end-review comment shows the friendly reason. Partial
+        // failures still return whatever findings we did collect — those
+        // are real signal even if some batches couldn't complete.
+        if (
+            batchErrors.length === batchTotal &&
+            batchTotal > 0 &&
+            allSuggestions.length === 0
+        ) {
+            this.agentLogger.error({
+                message: `[AGENT] ${identity.name} PR#${input.prNumber}: all ${batchTotal} batches failed; propagating first batch error to orchestrator`,
+                context: identity.name,
+                metadata: {
+                    prNumber: input.prNumber,
+                    batchTotal,
+                    firstError: batchErrors[0]?.message,
+                },
+            });
+            throw batchErrors[0];
         }
 
         const durationMs = Date.now() - startTime;
@@ -1432,6 +1815,7 @@ export abstract class BaseCodeReviewAgentProvider {
             agentReplicaTotal: input.agentReplicaTotal,
             turnsUsed: totalTurns,
             durationMs,
+            warnings: allWarnings,
         };
     }
 
@@ -1439,6 +1823,15 @@ export abstract class BaseCodeReviewAgentProvider {
         const isSelfContained = !input.remoteCommands;
         if (isSelfContained) {
             return this.buildSelfContainedSystemPrompt(input);
+        }
+
+        // Adaptive fit: when the resolved profile is `compact` or
+        // `minimal`, drop the Workflow PHASE 1/2/3 walk-through (~3K chars
+        // / ~750 tokens) and the per-category long-form prompt. Mindset
+        // and Scope stay — they're load-bearing behavioral cues. The
+        // category and language requirements collapse to one line each.
+        if (input.adaptiveProfile?.compactPrompt) {
+            return this.buildCompactSystemPrompt(input);
         }
 
         const identity = this.getIdentity();
@@ -1489,6 +1882,23 @@ export abstract class BaseCodeReviewAgentProvider {
         Examples: "Does Rails serializer require ? suffix on include_ methods?", "Does Python dataclass use shared mutable defaults?", "Does Prisma @updatedAt fire with empty data object?"
         Do NOT guess framework behavior — verify it.
 
+    STANCE — review like a senior engineer who treats the change as unproven.
+      Before judging any changed unit, first UNDERSTAND it: what does the surrounding
+      code actually do, and what is this change trying to accomplish (its intent/contract)?
+      Then reason about IMPACT: what does this change ripple into — callers,
+      implementations of a changed interface, shared state, invariants — and does it
+      still hold there?
+      A change being intentional does NOT make it correct. Your job is to PROVE it
+      fulfills its intent everywhere it touches:
+        - When the proof depends on another site (a caller, an implementation, a
+          function it now relies on), use getCallers / grep / readFile to actually
+          inspect that site — do not assume it was updated. A site left on the old
+          contract is a concrete defect.
+        - Apply the failure heuristics below to EACH changed unit — not only the one
+          that caught your eye.
+      Conclude "safe" only after a real attempt to break it came up empty.
+      "It looks correct" is not a verdict; "I traced X and confirmed Y holds" is.
+
     PHASE 2 — CHALLENGE (think adversarially)
 
       For each changed function, ask yourself these questions:
@@ -1504,10 +1914,10 @@ export abstract class BaseCodeReviewAgentProvider {
 
     PHASE 3 — RESPOND
 
-      Write reasoning that shows your adversarial analysis:
-        For each changed function: what you challenged, what you found, why you reported or dismissed it.
-        BAD reasoning: "The code looks correct."
-        GOOD reasoning: "Challenged CreateDevice: what if two requests pass count check simultaneously? Grepped TagDevice(, found caller at impl.go:155. No lock or unique constraint — race condition. Reported."
+      For each finding you report or dismiss, give a one-line certificate:
+        Premise (what the changed code does) → Path (the concrete input/state that makes it fail, or why it cannot) → Verdict (report/dismiss + the evidence you inspected).
+        BAD: "The code looks correct."
+        GOOD: "CreateDevice: Premise — inserts a device after a count check. Path — two concurrent requests pass the check before either writes (caller impl.go:155, no lock or unique constraint). Verdict — race, reported."
 
       Do not stop after finding the first issue — investigate ALL changed code before responding.
       Do not burn steps rereading the same body. If a readFile range overlaps heavily with what you already saw, reread only when a newly discovered symbol or branch creates a new concrete question; otherwise continue with grep, caller/callee tracing, or another changed file.
@@ -1522,7 +1932,7 @@ export abstract class BaseCodeReviewAgentProvider {
   <Scope>
     Root cause must be in lines added or modified by this PR.
     relevantFile/relevantLinesStart/relevantLinesEnd must point to the changed lines.
-    Trace impact through callers — symptom can appear elsewhere, but the cause must be in the diff.
+    Trace impact through callers — symptom can appear elsewhere, but the cause must be in the diff.${SCOPE_CROSS_FILE_EXTRA}
   </Scope>
 
 ${overridesSection}
@@ -1532,10 +1942,47 @@ ${memoryRulesSection}
 </CodeReviewAgent>`;
     }
 
+    /**
+     * Compact variant of `buildSystemPrompt` for the adaptive-fit
+     * `compact` / `minimal` profiles. Drops the Workflow walk-through
+     * (~3K chars) and the long category prompt, keeping only the
+     * behavioral spine (Role, one-line Mindset, one-line Scope) plus the
+     * user-configured override/memory blocks (those are not optional —
+     * the user wrote them). Estimated saving: ~3–3.5K tokens vs the
+     * full prompt.
+     */
+    private buildCompactSystemPrompt(input: ReviewAgentInput): string {
+        const identity = this.getIdentity();
+        const categoryLabel = this.getCategoryLabel();
+        const overridesSection = this.formatOverrides(input);
+        const memoryRulesSection = this.formatMemoryRules(input.memoryRules);
+        const langLabel = resolveLanguageLabel(input.languageResultPrompt);
+        const langLine = langLabel
+            ? `\n  Write all review output in ${langLabel}.`
+            : '';
+
+        return `<CodeReviewAgent>
+  <Role>You are ${identity.name}, a ${categoryLabel} code reviewer.${langLine}</Role>
+  <Mindset>Assume each change is broken until you can name the input that proves it safe. Default to reporting when you have code-backed suspicion.</Mindset>
+  <Workflow>For each changed function: grep callers and callees with the tools, read enough to confirm or dismiss, then submit via the submitResult tool.</Workflow>
+  <Scope>Root cause must be in lines added or modified by this PR. Trace impact through callers but anchor the finding to a changed line.</Scope>
+${overridesSection}
+${memoryRulesSection}
+</CodeReviewAgent>`;
+    }
+
     protected buildUserPrompt(input: ReviewAgentInput): string {
         const isSelfContained = !input.remoteCommands;
         if (isSelfContained) {
             return this.buildSelfContainedUserPrompt(input);
+        }
+
+        // Adaptive fit: compact user prompt cuts the OutputFormat JSON
+        // example (~1K chars; the submitResult tool schema already
+        // carries it) and trims <Rules> from ~25 bullets down to the
+        // core six that drive the reporting threshold.
+        if (input.adaptiveProfile?.compactPrompt) {
+            return this.buildCompactUserPrompt(input);
         }
 
         const prContextSection = this.formatPRContext(
@@ -1607,18 +2054,13 @@ ${callGraphSection}
   <Task>
     Review this Pull Request for ${taskDescription}.
     For each changed function: grep callers → read context → challenge with adversarial questions.${input.callGraph ? '\n    Use the call graph above as a fast map of production callers/callees, but still verify with tools before reporting.' : ''}
-    Promote a finding only when you can point to a concrete failure path, broken contract, wrong branch behavior, unsafe state transition, or caller/callee incompatibility introduced by the diff.
-    Prefer concrete findings over speculative theories. Dismiss only what you can explain WHY it cannot fail.
+    Promote a finding when the changed code gives you a code-backed suspicion of a defect. You don't need to fully prove the failure — anchor it to a specific changed line and let the verifier filter unsupported claims.
+    Dismiss only what you can explain WHY it cannot fail; when in doubt, report rather than self-censor.
 ${mixedLabelTaskGuidance}
   </Task>
 
   <CoverageContract>
-    ${
-        input.fileTiers
-            ? 'You must readFile EVERY hunk of every CRITICAL file below before finalizing — a file with multiple hunks is only fully covered when each listed line range has been read. Warm files contribute to the 70% total coverage requirement — readFile their hunks if budget allows. Optional files appear with hunk headers only; do not spend steps on them unless a concrete hypothesis points to one.'
-            : 'You must readFile EVERY hunk of every changed file below before finalizing. A file with multiple hunks is only fully covered when each listed line range has been read; reading the first hunk of a multi-hunk file does NOT cover the rest.'
-    }
-    grep, findFile, and listDir help navigation, but they do not count as coverage.
+    Below are the changed hunks. Go DEEP on the ones that can hide a bug — trace callers, read the surrounding logic, challenge each with adversarial questions. SKIP trivial hunks (renames, formatting, comments, config/lockfiles). You do NOT need to read every hunk: fully reasoning about the few suspicious ones beats skimming all of them. Depth of analysis over breadth of reading.
 ${coverageTargets ? `${coverageTargets}\n` : ''}
   </CoverageContract>
 
@@ -1626,18 +2068,15 @@ ${coverageTargets ? `${coverageTargets}\n` : ''}
     - Root cause must be in lines added or modified by this PR.
     - Pre-existing issues: report only if this PR makes them worse or newly reachable.
     - "Looks correct" is not a valid reason to dismiss — explain the specific reason it is safe.
-    - Before finalizing, make sure you have inspected every ${input.fileTiers ? 'CRITICAL' : 'changed'} file listed above.
-    - Before reporting, be able to answer at least one of these: which changed line creates the risk, what concrete failing path follows, which caller/callee assumption is broken, or what observable bad behavior would happen.
-    - Do not promote a finding from a mere possibility. Plausible is not enough. The changed code plus the code you inspected must show a concrete failure path and a concrete wrong outcome.
-    - Do not report generic resource exhaustion, shell injection, bypass, or performance theories unless the modified code directly creates or worsens that path.
-    - Clear local defects in the diff should still be reported immediately. Cross-file claims require at least one confirming reference from a caller, callee, test, or nearby state transition.
+    - Before finalizing, make sure you went DEEP on the suspicious hunks — skipping trivial ones is fine.
+    - Reporting threshold (high-recall): report any defect the changed code makes you suspect, as long as you (1) anchor it to a specific changed line and (2) name the kind of failure — wrong output, crash, broken contract, wrong target or branch, lost side effect, or broken caller/callee assumption. You do NOT need to prove the exact triggering input or rule out every safe explanation; a later verifier filters unsupported claims. Only pure speculation with no anchor in the changed code is out.
+    - Resource-exhaustion, injection, bypass, or performance concerns: report them when the changed code makes you suspect them — anchor to a changed line and let the verifier filter; do not pre-suppress by class.
+    - Clear local defects in the diff should still be reported immediately. Cross-file claims are welcome — anchor to a changed line and name the other site to check; the verifier confirms.
     - Before every readFile call, identify the exact unanswered question that this read will answer.
     - Do not reread the same or highly overlapping range just to gain confidence. Confidence-seeking rereads are a mistake.
     - Treat redundant readFile calls as a mistake. Only reread overlapping lines if a newly discovered symbol, caller/callee, or branch creates a new concrete question that the previous read did not answer.
-    - Do NOT report generic efficiency concerns (O(N), N+1, redundant calls, missing pagination, missing timeouts) as bugs. Report them only when the changed code creates a concrete, material slowdown or resource blowup, and then label them as performance.
-    - Do NOT report missing defensive measures (missing CSRF, missing rate limiting, missing input validation) unless you can demonstrate a specific exploit path in the changed code.
-    - Every finding must pass this test: "Can I name the exact input or state that triggers the failure, and the exact wrong behavior, wrong output, or crash that results?" If not, do not report it.
-    - Before reporting, ask what would make the behavior intentional or safe. If the code you inspected does not let you reject that safe explanation, do not report the finding.
+    - Performance concerns (O(N), N+1, redundant calls, missing pagination/timeouts): report them when the changed code makes you suspect a real slowdown — label as performance and let the verifier filter; do not pre-suppress by class.
+    - Missing defensive measures (CSRF, rate limiting, input validation): report them when the changed code plausibly exposes the gap — anchor to a changed line and let the verifier judge exploitability; do not pre-suppress by class.
     - Concrete findings include build-time and contract failures too. If the diff introduces a signature mismatch, wrong delegate call, impossible method call, or dropped required side effect, you may report it even without a runtime trace.
     - For wrappers, middleware, providers, caches, and adapters, verify both behavior and wiring: the changed code may be wrong because it calls the wrong target, preserves the wrong cached semantics, or silently stops propagating tracing/logging/metrics/auth state.
     - For security flows, challenge any value that became static, shared, or reused across requests/users when it should be per-request, per-session, or per-principal.
@@ -1678,6 +2117,58 @@ ${coverageTargets ? `${coverageTargets}\n` : ''}
   </OutputFormat>
 </ReviewTask>`
         );
+    }
+
+    /**
+     * Compact variant of `buildUserPrompt` for adaptive-fit
+     * `compact` / `minimal` profiles. Drops the OutputFormat JSON example
+     * (~1K chars — the submitResult tool schema already enforces shape)
+     * and collapses <Rules> from ~25 bullets to the 6 that actually
+     * drive the report/dismiss threshold. CoverageContract is kept but
+     * trimmed to one line. Estimated saving: ~3–4K tokens vs the full
+     * user prompt; the larger the PR, the higher the absolute savings
+     * because <Diffs> is preserved (it's the actual data the model
+     * reviews).
+     */
+    private buildCompactUserPrompt(input: ReviewAgentInput): string {
+        const prContextSection = this.formatPRContext(
+            input.prTitle,
+            input.prBody,
+        );
+        const diffsSection = this.formatDiffs(input.changedFiles);
+        const callGraphSection = input.callGraph
+            ? `\n  ${input.callGraph}`
+            : '';
+        const coverageTargets = formatCoverageTargetsForPrompt(
+            input.changedFiles,
+            20,
+            input.fileTiers ? { fileTiers: input.fileTiers } : undefined,
+        );
+        const categoryLabel = this.getCategoryLabel();
+        const mixedLabelMode = this.supportsMixedLabels();
+        const allowedSuggestionLabels = this.getAllowedSuggestionLabels(input);
+        const labelHint = mixedLabelMode
+            ? `\n    Label each finding as one of: ${allowedSuggestionLabels.join(', ')}.`
+            : '';
+
+        return `<ReviewTask>
+  ${prContextSection}
+  <Diffs>
+${diffsSection}
+  </Diffs>
+${callGraphSection}
+  <Task>Review this PR for real ${categoryLabel} issues introduced by the diff. For each changed function: grep callers, read enough to confirm, then submit.${labelHint}</Task>
+  <CoverageContract>readFile every hunk of every changed file below before submitting. grep does not count as coverage.
+${coverageTargets ?? ''}</CoverageContract>
+  <Rules>
+    - Root cause must be in lines added or modified by this PR.
+    - Report only with a concrete failure path: name the input, the wrong behavior, and the changed line that causes it.
+    - "Looks correct" is not a dismissal — explain why it cannot fail.
+    - No speculative findings (missing rate-limiting, generic N+1, defensive measures) unless the diff creates the exploit/slowdown.
+    - Assign confidence 1–10. Be honest: ≥9 only when both caller and callee read; ≤4 = speculative, do not report below 5.
+    - Submit via the submitResult tool; do not print free-form JSON.
+  </Rules>
+</ReviewTask>`;
     }
 
     /**
@@ -1742,7 +2233,7 @@ ${coverageTargets ? `${coverageTargets}\n` : ''}
 
   <Scope>
     Root cause must be in lines added or modified by this change.
-    relevantFile/relevantLinesStart/relevantLinesEnd must point to the changed lines.
+    relevantFile/relevantLinesStart/relevantLinesEnd must point to the changed lines.${SCOPE_CROSS_FILE_EXTRA}
   </Scope>
 
 ${overridesSection}

@@ -3,8 +3,8 @@
 # manual testing / bug repro / demos. Stays alive until you run destroy.sh.
 #
 # Usage:
-#   yarn selfhosted:provision                     # default instance
-#   yarn selfhosted:provision --name wellington   # named instance (multi-tenant)
+#   pnpm run selfhosted:provision                     # default instance
+#   pnpm run selfhosted:provision --name wellington   # named instance (multi-tenant)
 #
 # Required env (or scripts/selfhosted/.env):
 #   DIGITALOCEAN_TOKEN     DO API token        (default provider)
@@ -58,7 +58,7 @@ if state_exists "$NAME"; then
         exit 0
     fi
     warn "Instance '$NAME' already exists (IP $EXISTING_IP)."
-    warn "Run 'yarn selfhosted:status' to inspect, 'yarn selfhosted:destroy --name $NAME' to destroy, or pass --reuse to skip when present."
+    warn "Run 'pnpm run selfhosted:status' to inspect, 'pnpm run selfhosted:destroy --name $NAME' to destroy, or pass --reuse to skip when present."
     exit 1
 fi
 
@@ -71,7 +71,7 @@ fi
 # in the prompts — they just press Enter to save them. No retyping.
 if [ ! -f "$GLOBAL_CONFIG" ]; then
     log "First-time setup: no config at $GLOBAL_CONFIG yet."
-    log "Running 'yarn selfhosted:setup' so you only type secrets once."
+    log "Running 'pnpm run selfhosted:setup' so you only type secrets once."
     echo ""
     "$SCRIPT_DIR/setup.sh"
     echo ""
@@ -266,16 +266,16 @@ rollback_on_failure() {
         warn ""
         warn "  Server:  $SERVER_ID @ $SERVER_IP"
         warn "  SSH:     ssh -i $LOCAL_SSH_KEY root@$SERVER_IP"
-        warn "  Logs:    yarn selfhosted:logs${NAME:+ --name $NAME}"
-        warn "  Status:  yarn selfhosted:status${NAME:+ --name $NAME}"
-        warn "  Destroy: yarn selfhosted:destroy${NAME:+ --name $NAME}"
+        warn "  Logs:    pnpm run selfhosted:logs${NAME:+ --name $NAME}"
+        warn "  Status:  pnpm run selfhosted:status${NAME:+ --name $NAME}"
+        warn "  Destroy: pnpm run selfhosted:destroy${NAME:+ --name $NAME}"
         warn ""
         warn "  Remember: this droplet costs ~\$1/day. Destroy it when you're done."
         exit "$exit_code"
     fi
 
     if [ -f "$STATE_FILE" ]; then
-        warn "Provision failed AFTER state file was written. Run 'yarn selfhosted:destroy --name $NAME' to clean up."
+        warn "Provision failed AFTER state file was written. Run 'pnpm run selfhosted:destroy --name $NAME' to clean up."
         exit "$exit_code"
     fi
 
@@ -335,7 +335,9 @@ case "$TEST_VM_PROVIDER" in
     *) err "Unknown TEST_VM_PROVIDER=$TEST_VM_PROVIDER"; exit 1 ;;
 esac
 
-if [ ! -d "$KODUS_INSTALLER_PATH" ]; then
+# The benchmark farm (BENCH_BASE_ONLY=1) builds the stack from kodus-ai source
+# on the droplet and never touches kodus-installer, so don't require it there.
+if [ "${BENCH_BASE_ONLY:-0}" != "1" ] && [ ! -d "$KODUS_INSTALLER_PATH" ]; then
     err "KODUS_INSTALLER_PATH=$KODUS_INSTALLER_PATH does not exist."
     err "Either clone https://github.com/kodustech/kodus-installer next to this repo,"
     err "or set KODUS_INSTALLER_PATH to your local checkout."
@@ -410,6 +412,21 @@ log "Waiting for cloud-init (~2 min)..."
 ssh_vm "cloud-init status --wait" >/dev/null
 ssh_vm "test -f /var/lib/cloud/instance/kodus-ready" || { err "cloud-init failed"; exit 1; }
 
+# ---------- base-only mode (benchmark farm) ----------
+# BENCH_BASE_ONLY=1 stops here: a bare droplet with Docker + git + rsync +
+# cloudflared (installed by cloud-init above) and nothing else. The benchmark
+# farm (scripts/benchmark/farm/) rsyncs the kodus-ai SOURCE for a given branch
+# and builds the compiled artifact ON the droplet via docker-compose.bench.yml,
+# instead of pulling kodus-installer's prebuilt GHCR images. Everything below
+# (installer transfer + install.sh + GHCR) is skipped.
+if [ "${BENCH_BASE_ONLY:-0}" = "1" ]; then
+    save_state "base-ready"
+    ok "Base droplet ready (BENCH_BASE_ONLY) — '${NAME}' at ${SERVER_IP}"
+    dim "  Docker + cloudflared installed; no Kodus stack yet."
+    dim "  Build a branch onto it: scripts/benchmark/farm/bench-sync.sh ${NAME#bench-} <branch>"
+    exit 0
+fi
+
 # ---------- transfer installer ----------
 log "Transferring kodus-installer from $KODUS_INSTALLER_PATH..."
 ssh_vm "mkdir -p /opt/kodus-installer"
@@ -422,7 +439,7 @@ ssh_vm "chmod +x /opt/kodus-installer/scripts/*.sh"
 ok "Installer transferred"
 
 # ---------- apply cached dev image override (if any) ----------
-# If the operator ran `yarn selfhosted:deploy --name <something>` at any
+# If the operator ran `pnpm run selfhosted:deploy --name <something>` at any
 # point on this Mac, it cached a docker-compose.override.yml at
 # ~/.kodus-dev/last-deploy.override.yml that pins every kodus-* service
 # to a specific dev-tag in their personal GHCR namespace. Apply it to
@@ -535,9 +552,12 @@ REMOTE
 
 if [ -n "${SH_LICENSE_KEY:-}" ]; then
     log "Injecting SH_LICENSE_KEY..."
-    ssh_vm "cd /opt/kodus-installer && grep -qE '^API_KODUS_LICENSE_KEY=' .env \
-            && sed -i 's|^API_KODUS_LICENSE_KEY=.*|API_KODUS_LICENSE_KEY=$SH_LICENSE_KEY|' .env \
-            || echo 'API_KODUS_LICENSE_KEY=$SH_LICENSE_KEY' >> .env"
+    # KODUS_LICENSE_KEY is the customer-facing var SelfHostedLicenseService
+    # reads (NOT API_-prefixed). Injecting the wrong name leaves the install
+    # effectively unlicensed → enterprise features 403.
+    ssh_vm "cd /opt/kodus-installer && grep -qE '^KODUS_LICENSE_KEY=' .env \
+            && sed -i 's|^KODUS_LICENSE_KEY=.*|KODUS_LICENSE_KEY=$SH_LICENSE_KEY|' .env \
+            || echo 'KODUS_LICENSE_KEY=$SH_LICENSE_KEY' >> .env"
 else
     dim "  No SH_LICENSE_KEY set — stack will boot in installer default mode (no paid features)."
 fi
@@ -561,6 +581,38 @@ done
 if [ ${#HEALTH_FAILED[@]} -gt 0 ]; then
     err "Health check failed for: ${HEALTH_FAILED[*]}"
     ssh_vm "cd /opt/kodus-installer && docker compose logs api worker webhooks --tail 80 --no-color" || true
+    exit 1
+fi
+
+# ---------- wait for the review pipeline (RabbitMQ workflow queue) ----------
+# The HTTP checks above only prove web/api/webhooks ANSWER. The code-review
+# pipeline runs through RabbitMQ (@kodus/flow): the webhooks service
+# publishes a job to `workflow.jobs.code_review.queue` and the worker
+# consumes it. On a cold boot the worker declares + binds that queue only
+# after its (slow) NestJS init; until then the producer hits
+# "404 NOT_FOUND - no queue ... QueueBind", the AMQP channel is closed, and
+# the job is DROPPED — while the webhook still returns 200. Handing the
+# droplet to the test in that window means a PR opened in the first ~minute
+# gets a 200 ack but NO review, silently. (NB: the separate self-hosted
+# "0 findings" chased on 2026-05-26 turned out to be license SEAT enforcement,
+# NOT this queue race — but the cold-boot window is a real silent-drop risk
+# regardless.) So gate readiness on the queue being declared AND consumed.
+log "Waiting for review pipeline queue (RabbitMQ) to be ready..."
+QUEUE_READY=0
+for i in $(seq 1 60); do
+    line=$(ssh_vm "docker exec rabbitmq-prod rabbitmqctl list_queues -t 10 -p kodus-ai name consumers --no-table-headers 2>/dev/null | grep -E '^workflow.jobs.code_review.queue[[:space:]]'" 2>/dev/null || true)
+    consumers=$(printf '%s' "$line" | awk '{print $NF}')
+    if [ -n "$consumers" ] && [ "$consumers" -ge 1 ] 2>/dev/null; then QUEUE_READY=1; break; fi
+    sleep 3
+done
+if [ "$QUEUE_READY" = "1" ]; then
+    # Settle buffer: let the webhooks producer channel reconnect after any
+    # startup 404 before the first real PR event arrives.
+    sleep 5
+    ok "Review pipeline queue ready (consumer attached)"
+else
+    err "Review queue 'workflow.jobs.code_review.queue' never got a consumer within ~3min — worker likely failed to start. Reviews would be silently dropped, so refusing to mark the stack ready."
+    ssh_vm "docker logs kodus-worker-prod --tail 80 --no-color" || true
     exit 1
 fi
 
@@ -687,13 +739,13 @@ $(echo -e "${GREEN}✅ Self-hosted stack online in ${MINS}m${SECS}s${NC}")
   $(echo -e "${BLUE}GH wired:${NC}")  $GH_CONFIGURED
 
   $(echo -e "${GRAY}SSH:${NC}")       ssh -i $LOCAL_SSH_KEY root@$SERVER_IP
-  $(echo -e "${GRAY}Status:${NC}")    yarn selfhosted:status${NAME:+ --name $NAME}
-  $(echo -e "${GRAY}Logs:${NC}")      yarn selfhosted:logs${NAME:+ --name $NAME}
-  $(echo -e "${GRAY}Destroy:${NC}")   yarn selfhosted:destroy${NAME:+ --name $NAME}
+  $(echo -e "${GRAY}Status:${NC}")    pnpm run selfhosted:status${NAME:+ --name $NAME}
+  $(echo -e "${GRAY}Logs:${NC}")      pnpm run selfhosted:logs${NAME:+ --name $NAME}
+  $(echo -e "${GRAY}Destroy:${NC}")   pnpm run selfhosted:destroy${NAME:+ --name $NAME}
 
 $(echo -e "${YELLOW}⚠️  This is a PUBLISHED image, NOT your local code.${NC}")
 $(echo -e "${YELLOW}    To test your current branch instead:${NC}")
-$(echo -e "${YELLOW}    →  yarn selfhosted:deploy${NAME:+ --name $NAME}${NC}")
+$(echo -e "${YELLOW}    →  pnpm run selfhosted:deploy${NAME:+ --name $NAME}${NC}")
 
 $(echo -e "${YELLOW}This VM is ALIVE. Cost: ~\$1/day on DO. Destroy when done.${NC}")
 

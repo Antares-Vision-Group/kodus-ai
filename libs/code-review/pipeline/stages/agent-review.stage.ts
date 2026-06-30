@@ -4,9 +4,23 @@ import { createLogger } from '@kodus/flow';
 import { Output, jsonSchema } from 'ai';
 import { Inject, Injectable } from '@nestjs/common';
 import { tracedGenerateText } from '@libs/code-review/infrastructure/agents/llm/agent-loop';
+import { resolveAdaptiveProfile } from '@libs/code-review/infrastructure/agents/llm/adaptive-fit';
+import { resolveContextWindow } from '@libs/code-review/infrastructure/agents/llm/model-context-window';
+import {
+    DEDUP_MODEL_ID,
+    DEDUP_SCHEMA,
+    DEDUP_CONTENT_THRESHOLD,
+    buildDedupPrompt,
+    contentSimilarity,
+} from '@libs/code-review/infrastructure/agents/llm/dedup-prompt';
+import {
+    dedupReviewWarnings,
+    type ReviewWarning,
+} from '@libs/code-review/infrastructure/agents/llm/review-warnings';
 import {
     withStructuredOutputFallback,
     NoStructuredFallbackModelError,
+    getModelName,
 } from '@libs/code-review/infrastructure/agents/llm/byok-to-vercel';
 import { buildKodyRuleLink } from '@libs/code-review/utils/build-kody-rule-link';
 import {
@@ -273,6 +287,71 @@ export class AgentReviewStage extends BasePipelineStage<CodeReviewPipelineContex
             performance: true,
         };
 
+        // Resolve adaptive-fit profile once for this run. The profile drives
+        // which fidelity strategies (drop callGraph, compact prompt, etc) fire
+        // and is also passed through to BaseCodeReviewAgentProvider via
+        // ReviewAgentInput so per-agent code paths gate on the same flags.
+        // Per-repo/directory model override (byokModel) takes priority over
+        // the org-level main.model when present — same resolution the agent
+        // uses internally (`base-code-review-agent.provider.ts:541-551`).
+        const mainByok = context.codeReviewConfig?.byokConfig?.main;
+        const overrideModel =
+            context.codeReviewConfig?.byokModel?.trim();
+        const byokWithOverride =
+            overrideModel && mainByok
+                ? {
+                      ...context.codeReviewConfig?.byokConfig,
+                      main: { ...mainByok, model: overrideModel },
+                  }
+                : context.codeReviewConfig?.byokConfig;
+        // Use the same model-name formatter the agent uses (provider:model)
+        // so stage-emitted warnings and agent-emitted warnings share a
+        // dedup key. Otherwise dedupReviewWarnings sees them as distinct
+        // and the user sees duplicate bullets (PROMPT_COMPACTED listed
+        // twice — once with "gemini-2.5-flash" and once with
+        // "google_gemini:gemini-2.5-flash").
+        const effectiveModelName = getModelName(byokWithOverride);
+        const effectiveContextWindow = resolveContextWindow({
+            byokMaxInputTokens: mainByok?.maxInputTokens,
+            modelName: overrideModel || mainByok?.model || '',
+        });
+        const adaptiveProfile = resolveAdaptiveProfile(effectiveContextWindow);
+        const stageWarnings: ReviewWarning[] = [];
+        const emitStageWarning = (
+            kind: ReviewWarning['kind'],
+            detail?: string,
+        ) => {
+            stageWarnings.push({
+                kind,
+                reason: 'small_context_window',
+                contextWindowTokens: effectiveContextWindow,
+                modelName: effectiveModelName || 'unknown',
+                detail,
+            });
+        };
+
+        if (adaptiveProfile.kind !== 'full') {
+            this.logger.log({
+                message: `[AGENT] adaptive-fit profile=${adaptiveProfile.kind} window=${effectiveContextWindow} model=${effectiveModelName}`,
+                context: this.stageName,
+                metadata: {
+                    prNumber,
+                    profile: adaptiveProfile.kind,
+                    contextWindow: effectiveContextWindow,
+                    modelName: effectiveModelName,
+                    flags: {
+                        dropCallGraph: adaptiveProfile.dropCallGraph,
+                        skipHeavyPasses: adaptiveProfile.skipHeavyPasses,
+                        compactPrompt: adaptiveProfile.compactPrompt,
+                        allOptional: adaptiveProfile.allOptional,
+                        maxDiffChars: adaptiveProfile.maxDiffChars,
+                        lowSignalFilterUnconditional:
+                            adaptiveProfile.lowSignalFilterUnconditional,
+                    },
+                },
+            });
+        }
+
         const startTime = Date.now();
 
         this.logger.log({
@@ -310,7 +389,20 @@ export class AgentReviewStage extends BasePipelineStage<CodeReviewPipelineContex
 
             // Generate call graph context from AST graph in DB (via kodus-graph in E2B sandbox)
             let callGraph = '';
-            try {
+            // Adaptive fit: a 1–3K-token callGraph fragment is the cheapest
+            // thing to drop when the model's window can't hold the full
+            // prompt. `light+` profiles always skip it. The agent still has
+            // grep/readFile to investigate cross-file relationships on demand.
+            const shouldBuildCallGraph = !adaptiveProfile.dropCallGraph;
+            if (!shouldBuildCallGraph) {
+                this.logger.log({
+                    message: `[AGENT] adaptive-fit (${adaptiveProfile.kind}): skipping callGraph build to fit context window`,
+                    context: this.stageName,
+                });
+                emitStageWarning('CALLGRAPH_DROPPED');
+            }
+            if (shouldBuildCallGraph) {
+              try {
                 const sandboxType = context.sandboxHandle?.type ?? 'unknown';
                 const hasSandbox = !!context.sandboxHandle?.run;
                 this.logger.log({
@@ -389,6 +481,7 @@ export class AgentReviewStage extends BasePipelineStage<CodeReviewPipelineContex
                     },
                 });
             }
+            } // end if (shouldBuildCallGraph)
 
             const result = await this.reviewOrchestrator.execute({
                 organizationAndTeamData: context.organizationAndTeamData,
@@ -423,14 +516,84 @@ export class AgentReviewStage extends BasePipelineStage<CodeReviewPipelineContex
                 callGraph,
                 callGraphJson: context.callGraphJson,
                 reviewMode: context.codeReviewConfig?.reviewMode || 'normal',
+                // Trial reviews get a forced default model (only consulted
+                // when there's no BYOK config). Two distinct "trial" surfaces,
+                // each with its OWN model:
+                //   1. Subscription trial — signed-up orgs in their 14-day
+                //      trial (`subscriptionStatus === 'trial'`, captured by
+                //      ValidatePrerequisitesStage). Routed to Kimi K2.6: they
+                //      run the managed pipeline with no BYOK, so without this
+                //      they'd burn the expensive 3.1-pro default on Kodus's
+                //      dime for the whole trial window. The `kimi-` prefix
+                //      routes through Moonshot's OpenAI-compatible endpoint in
+                //      byokToVercelModel (reads API_MOONSHOT_API_KEY — that env
+                //      MUST be set in the cloud deployment).
+                //   2. Anonymous public demo (`isTrialMode`, try.kodus.io) —
+                //      kept on Gemini 3 Flash: it's a latency-sensitive public
+                //      demo and the try UI advertises "Gemini 3 Flash". Without
+                //      this it would fall back to the slow 3.1-pro default
+                //      (~4-5 min).
+                // Either override is ignored when a BYOK config is present
+                // (byokToVercelModel prefers BYOK), so a trial org that
+                // configured its own key keeps using it.
+                // `isTrialMode` lives on the CLI pipeline context — we can't
+                // import that type here without inverting the dep graph
+                // (cli-review depends on code-review), so the cast is
+                // intentional.
+                defaultModelOverride:
+                    context.pipelineMetadata?.subscriptionStatus === 'trial'
+                        ? 'kimi-k2.6'
+                        : (context as { isTrialMode?: boolean }).isTrialMode
+                          ? 'gemini-3-flash-preview'
+                          : undefined,
                 // Per-repo/directory model override resolved by ValidateConfigStage.
                 byokModel: context.codeReviewConfig?.byokModel,
+                // Adaptive-fit profile: agents read this to decide whether
+                // to compact the prompt, force all-optional tiering, drop
+                // low-signal files unconditionally, truncate per-file diffs,
+                // and skip heavy passes. Resolved once at the stage so the
+                // stage-level decisions (callGraph, heavy passes) and
+                // per-agent decisions agree.
+                adaptiveProfile,
+                // Auto-skip heavy passes (verifier, second-chance, rescue)
+                // when the profile says so. These are independent
+                // generateText calls that re-incur the full prompt overhead;
+                // on small windows they're guaranteed to refire the same
+                // preflight error. Don't override an explicit caller value.
+                skipHeavyPasses:
+                    adaptiveProfile.skipHeavyPasses || undefined,
                 // Forwarded from the workflow job timeout. The router builds
                 // an AbortController; here we pass it through so when the
                 // 1h45min budget fires, the agent-loop's local controller is
                 // aborted via parentSignal composition.
                 parentSignal: context.parentSignal,
             });
+
+            // Emit profile-driven warnings up here at the stage so they
+            // surface even when the agent's overhead preflight throws
+            // before its own emission points. These four are decided
+            // purely by the resolved profile — no PR-specific condition
+            // needed. The agent will re-emit some of them when it runs;
+            // dedupReviewWarnings folds the duplicates so the user sees
+            // each kind once. Without this, a preflight-failed run only
+            // shows 2 warnings (CALLGRAPH_DROPPED + HEAVY_PASSES_SKIPPED)
+            // while a successful run on the same profile shows 4–5 —
+            // confusing UX where the failure looks "less degraded" than
+            // the success.
+            //
+            // The agent-only warnings (LOW_SIGNAL_FILES_DROPPED with
+            // file count, DIFF_TRUNCATED with file names) are conditional
+            // on real PR state and intentionally NOT emitted here — we
+            // don't know yet whether the conditions apply.
+            if (adaptiveProfile.skipHeavyPasses) {
+                emitStageWarning('HEAVY_PASSES_SKIPPED');
+            }
+            if (adaptiveProfile.compactPrompt) {
+                emitStageWarning('PROMPT_COMPACTED');
+            }
+            if (adaptiveProfile.allOptional) {
+                emitStageWarning('HUNK_HEADERS_ONLY');
+            }
 
             const durationMs = Date.now() - startTime;
 
@@ -440,7 +603,7 @@ export class AgentReviewStage extends BasePipelineStage<CodeReviewPipelineContex
                 metadata: {
                     prNumber,
                     suggestionsCount: result.suggestions.length,
-                    agentResults: result.agentResults.map((r) => ({
+                    agentResults: (result.agentResults ?? []).map((r) => ({
                         agent: r.agentName,
                         category: r.agentCategory,
                         replicaIndex: r.agentReplicaIndex,
@@ -546,9 +709,40 @@ export class AgentReviewStage extends BasePipelineStage<CodeReviewPipelineContex
                 });
             }
 
+            // Surface adaptive-fit fidelity warnings (stage-level +
+            // orchestrator-deduped per-agent) so the end-review PR comment
+            // can render a collapsible "review fidelity reduced" section,
+            // and so telemetry can roll up "how often does each kind fire".
+            // Stage-level warnings (CALLGRAPH_DROPPED, HEAVY_PASSES_SKIPPED)
+            // come from this stage's own decisions; orchestrator's
+            // result.warnings come from the per-agent loops.
+            // Dedup at the merge point — a stage-level CALLGRAPH_DROPPED
+            // and an agent-level one for the same (model, window) fold
+            // into a single bullet in the user-facing notice.
+            const allWarnings = dedupReviewWarnings([
+                ...stageWarnings,
+                ...(result.warnings ?? []),
+            ]);
+            if (allWarnings.length > 0) {
+                context = this.updateContext(context, (draft) => {
+                    draft.reviewWarnings = allWarnings;
+                });
+                this.logger.log({
+                    message: `[AGENT] Review fidelity warnings: ${allWarnings
+                        .map((w) => w.kind)
+                        .join(', ')}`,
+                    context: this.stageName,
+                    metadata: {
+                        prNumber,
+                        warningKinds: allWarnings.map((w) => w.kind),
+                        warningCount: allWarnings.length,
+                    },
+                });
+            }
+
             // Collect suggestions discarded by severity filter and verify
             const allDiscarded: Partial<CodeSuggestion>[] = [];
-            for (const agentResult of result.agentResults) {
+            for (const agentResult of result.agentResults ?? []) {
                 if (agentResult.discardedBySeverity?.length) {
                     for (const s of agentResult.discardedBySeverity) {
                         allDiscarded.push({
@@ -1200,20 +1394,14 @@ export class AgentReviewStage extends BasePipelineStage<CodeReviewPipelineContex
             };
         }
 
-        // Model resolution: Google AI key → BYOK via withStructuredOutputFallback → skip dedup
-        const googleKey =
-            process.env.API_GOOGLE_AI_API_KEY ||
-            process.env.GOOGLE_GENERATIVE_AI_API_KEY;
+        // Model resolution: platform OpenAI key (gpt-5.4-mini, see DEDUP_MODEL_ID)
+        // → BYOK via withStructuredOutputFallback → skip dedup. Swapped off the
+        // Google path because that project can get rate-denied env-wide and
+        // silently disable dedup; gpt-5.4-mini is a separate vendor + quality-
+        // equivalent on the dedup eval.
+        const openaiKey = process.env.API_OPEN_AI_API_KEY;
 
         try {
-            // Build summaries with file + lines for cross-file comparison
-            const summaries = suggestions
-                .map(
-                    (s, i) =>
-                        `[${i}] ${s.relevantFile || 'unknown'}:${s.relevantLinesStart}-${s.relevantLinesEnd} [${s.label || 'unknown'}/${this.normalizeSeverity(s.severity)}]: ${s.oneSentenceSummary || s.suggestionContent?.substring(0, 200)}${s.improvedCode ? `\n    fix: ${s.improvedCode.substring(0, 100)}` : ''}`,
-                )
-                .join('\n');
-
             const runDedup = (model: any) =>
                 tracedGenerateText({
                     model: model as any,
@@ -1222,71 +1410,22 @@ export class AgentReviewStage extends BasePipelineStage<CodeReviewPipelineContex
                         telemetryMeta,
                     ),
                     output: Output.object({
-                        schema: jsonSchema({
-                            type: 'object',
-                            properties: {
-                                groups: {
-                                    type: 'array',
-                                    description:
-                                        'Groups of suggestions. Each group has a representative and its duplicates.',
-                                    items: {
-                                        type: 'object',
-                                        properties: {
-                                            keep: {
-                                                type: 'number',
-                                                description:
-                                                    'Index of the best suggestion to keep as representative',
-                                            },
-                                            duplicates: {
-                                                type: 'array',
-                                                items: { type: 'number' },
-                                                description:
-                                                    'Indices of duplicate suggestions (same bug, same or different locations)',
-                                            },
-                                        },
-                                        required: ['keep', 'duplicates'],
-                                        additionalProperties: false,
-                                    },
-                                },
-                                unique: {
-                                    type: 'array',
-                                    items: { type: 'number' },
-                                    description:
-                                        'Indices of suggestions that have no duplicates',
-                                },
-                            },
-                            required: ['groups', 'unique'],
-                            additionalProperties: false,
-                        }),
+                        schema: jsonSchema(DEDUP_SCHEMA as any),
                     }) as any,
-                    prompt: `You have ${suggestions.length} code review suggestions across multiple files in a PR. Identify duplicates and group them.
-
-BE CONSERVATIVE — when in doubt, do NOT group. Only group when you are highly confident they describe the exact same bug.
-
-There are TWO types of duplicates:
-
-1. **EXACT DUPLICATES** (same bug, same location): Multiple suggestions pointing to the same file and overlapping lines describing the same issue. Keep the one with the most detail, discard the rest.
-
-2. **CROSS-LOCATION DUPLICATES** (same bug pattern, different locations): Suggestions describing the EXACT SAME code pattern/bug but applied in different files (e.g., "forEach with async callback" found in 3 different files, or "missing null check on the same API call" in 2 files). These should be GROUPED — keep the best one as representative, list the others as duplicates.
-
-NOT duplicates (keep both):
-- Different bugs in the same file or nearby lines (e.g., "nil pointer" and "missing validation" in the same controller — these are DIFFERENT bugs)
-- Different root causes even if they sound similar (e.g., "add nil check" vs "fix typo" — different problems)
-- Suggestions about different code even if the description sounds similar
-
-IGNORE the category label (bug/security/performance) when deciding — two agents can independently find the same issue.
-Prefer keeping the suggestion with the most detail or clearest fix as the representative.
-
-${summaries}`,
+                    prompt: buildDedupPrompt(suggestions, (sev) =>
+                        this.normalizeSeverity(sev),
+                    ),
                 });
 
             let dedupResult: any;
-            if (googleKey) {
-                const { createGoogleGenerativeAI } =
-                    await import('@ai-sdk/google');
-                const model = createGoogleGenerativeAI({ apiKey: googleKey })(
-                    'gemini-3-flash-preview',
-                );
+            if (openaiKey) {
+                const { createOpenAI } = await import('@ai-sdk/openai');
+                const model = createOpenAI({
+                    apiKey: openaiKey,
+                    ...(process.env.API_OPENAI_FORCE_BASE_URL
+                        ? { baseURL: process.env.API_OPENAI_FORCE_BASE_URL }
+                        : {}),
+                })(DEDUP_MODEL_ID);
                 dedupResult = await runDedup(model);
             } else {
                 dedupResult = await withStructuredOutputFallback(
@@ -1368,11 +1507,19 @@ ${summaries}`,
             const result: Partial<CodeSuggestion>[] = [];
             const uniqueSuggestions: DedupTraceSuggestionSummary[] = [];
             const groupSummaries: DedupTraceGroupSummary[] = [];
+            const addedIndices = new Set<number>();
+            const classifiedIndices = new Set<number>();
+            const indexToResult = new Map<number, number>();
+
+            // Layer 1: Number.isInteger guard — NaN and non-integer floats rejected immediately
 
             // Add unique suggestions as-is
             for (const idx of unique) {
-                if (idx >= 0 && idx < suggestions.length) {
+                if (Number.isInteger(idx) && idx >= 0 && idx < suggestions.length) {
+                    indexToResult.set(idx, result.length);
                     result.push(suggestions[idx]);
+                    addedIndices.add(idx);
+                    classifiedIndices.add(idx);
                     uniqueSuggestions.push(
                         this.summarizeDedupSuggestion(suggestions[idx]),
                     );
@@ -1384,19 +1531,87 @@ ${summaries}`,
                 const keepIdx = group.keep;
                 const dupIndices = group.duplicates || [];
 
-                if (keepIdx < 0 || keepIdx >= suggestions.length) {
+                if (!Number.isInteger(keepIdx) || keepIdx < 0 || keepIdx >= suggestions.length) {
+                    // Layer 2: keep is invalid — preserve valid duplicates as independent results
+                    for (const dupIdx of dupIndices) {
+                        classifiedIndices.add(dupIdx);
+                        if (Number.isInteger(dupIdx) && dupIdx >= 0 && dupIdx < suggestions.length && !addedIndices.has(dupIdx)) {
+                            indexToResult.set(dupIdx, result.length);
+                            result.push(suggestions[dupIdx]);
+                            addedIndices.add(dupIdx);
+                            uniqueSuggestions.push(
+                                this.summarizeDedupSuggestion(suggestions[dupIdx]),
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                // Skip if this keep was already added (malformed groups with overlapping indices)
+                if (addedIndices.has(keepIdx)) {
+                    // Merge duplicate locations into the already-added suggestion
+                    const existingIdx = indexToResult.get(keepIdx);
+                    if (existingIdx !== undefined) {
+                        const locations: string[] = [];
+                        for (const dupIdx of dupIndices) {
+                            if (Number.isInteger(dupIdx) && dupIdx >= 0 && dupIdx < suggestions.length) {
+                                classifiedIndices.add(dupIdx);
+                                const dup = suggestions[dupIdx];
+                                const loc = `${dup.relevantFile}:${dup.relevantLinesStart}-${dup.relevantLinesEnd}`;
+                                const keptLoc = `${suggestions[keepIdx].relevantFile}:${suggestions[keepIdx].relevantLinesStart}-${suggestions[keepIdx].relevantLinesEnd}`;
+                                if (loc !== keptLoc) {
+                                    locations.push(loc);
+                                }
+                            }
+                        }
+                        if (locations.length > 0) {
+                            const existing = result[existingIdx];
+                            const locList = locations.map((l) => `- \`${l}\``).join('\n');
+                            existing.suggestionContent = `${existing.suggestionContent}\n\n**Also found in:**\n${locList}`;
+                        }
+                    } else {
+                        for (const dupIdx of dupIndices) {
+                            if (Number.isInteger(dupIdx) && dupIdx >= 0 && dupIdx < suggestions.length) {
+                                classifiedIndices.add(dupIdx);
+                            }
+                        }
+                    }
                     continue;
                 }
 
                 const kept = { ...suggestions[keepIdx] };
+                addedIndices.add(keepIdx);
+                classifiedIndices.add(keepIdx);
                 const duplicateSummaries: DedupTraceSuggestionSummary[] = [];
 
                 // Collect locations from duplicates that are in DIFFERENT locations
                 const otherLocations: string[] = [];
                 for (const dupIdx of dupIndices) {
-                    if (dupIdx < 0 || dupIdx >= suggestions.length) {
+                    if (!Number.isInteger(dupIdx) || dupIdx < 0 || dupIdx >= suggestions.length) {
                         continue;
                     }
+                    // Content guard: only honor the model's merge when the two
+                    // findings actually describe the same thing. A low word-overlap
+                    // "duplicate" is a DIFFERENT bug the model over-merged (distinct
+                    // issues on overlapping lines) — keep it instead of dropping.
+                    if (
+                        contentSimilarity(
+                            suggestions[dupIdx],
+                            suggestions[keepIdx],
+                        ) < DEDUP_CONTENT_THRESHOLD
+                    ) {
+                        classifiedIndices.add(dupIdx);
+                        if (!addedIndices.has(dupIdx)) {
+                            addedIndices.add(dupIdx);
+                            indexToResult.set(dupIdx, result.length);
+                            result.push(suggestions[dupIdx]);
+                            uniqueSuggestions.push(
+                                this.summarizeDedupSuggestion(suggestions[dupIdx]),
+                            );
+                        }
+                        continue;
+                    }
+                    classifiedIndices.add(dupIdx);
                     const dup = suggestions[dupIdx];
                     duplicateSummaries.push(this.summarizeDedupSuggestion(dup));
                     const dupLocation = `${dup.relevantFile}:${dup.relevantLinesStart}-${dup.relevantLinesEnd}`;
@@ -1424,7 +1639,20 @@ ${summaries}`,
                     keep: this.summarizeDedupSuggestion(kept),
                     duplicates: duplicateSummaries,
                 });
+                indexToResult.set(keepIdx, result.length);
                 result.push(kept);
+            }
+
+            // Layer 3: Safety net — add any suggestions not classified by dedup
+            // (neither in unique nor in any group's keep/duplicates). This handles
+            // malformed LLM output that omits some indices entirely.
+            for (let i = 0; i < suggestions.length; i++) {
+                if (!classifiedIndices.has(i)) {
+                    result.push(suggestions[i]);
+                    uniqueSuggestions.push(
+                        this.summarizeDedupSuggestion(suggestions[i]),
+                    );
+                }
             }
 
             const totalRemoved = suggestions.length - result.length;
@@ -1719,8 +1947,14 @@ ${summaries}`,
                         existing.uuid,
                         updateData,
                     );
-                } else {
-                    // Fallback: create if not found
+                } else if (
+                    status === AutomationStatus.SUCCESS ||
+                    status === AutomationStatus.ERROR
+                ) {
+                    // Fallback for terminal events (completed/error) that raced
+                    // ahead of 'started', or where 'started' failed to emit.
+                    // Without this, the final SUCCESS/ERROR state and agentTrace
+                    // metadata would be silently dropped.
                     await this.automationExecutionService.updateCodeReview(
                         filter,
                         { status },
@@ -1729,6 +1963,13 @@ ${summaries}`,
                         metadata,
                     );
                 }
+                // Non-terminal events (batch_started, investigating, etc.) with
+                // no existing record are silently skipped. In chunked mode,
+                // batch_started fires before the recursive execute() emits
+                // started — both are fire-and-forget, so batch_started's
+                // findLatestStageLog may run before started creates the initial
+                // record. Creating a fallback here would produce an orphaned
+                // IN_PROGRESS record that never gets updated.
             }
         } catch {
             // Best effort

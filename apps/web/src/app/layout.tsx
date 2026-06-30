@@ -7,6 +7,7 @@ import { NuqsAdapter } from "nuqs/adapters/next/app";
 import QueryProvider from "src/core/providers/query.provider";
 import { getApiPublicUrl } from "src/core/utils/api-public-url";
 import { cn } from "src/core/utils/components";
+import { createUrl } from "src/core/utils/helpers";
 
 import { ConfigProvider } from "@providers/ConfigProvider";
 import type { PublicConfig } from "@config/publicConfig";
@@ -67,6 +68,13 @@ export default function RootLayout({ children }: React.PropsWithChildren) {
         releaseVersion: process.env.RELEASE_VERSION ?? "",
         nodeEnv: process.env.WEB_NODE_ENV ?? "",
         apiPublicUrl: getApiPublicUrl(),
+        helpdeskUrl: process.env.WEB_HOSTNAME_HELPDESK
+            ? createUrl(
+                  process.env.WEB_HOSTNAME_HELPDESK,
+                  process.env.WEB_PORT_HELPDESK,
+                  "/auth/cloud",
+              )
+            : "",
     };
 
     // Expose publicConfig as window.__KODUS_PUBLIC_CONFIG__ so module-scope
@@ -80,7 +88,7 @@ export default function RootLayout({ children }: React.PropsWithChildren) {
 
     return (
         <html lang="en" className="dark" style={{ colorScheme: "dark" }}>
-            <GoogleTagManager gtmId="GTM-KN2J57G" />
+            <GoogleTagManager gtmId="GTM-T2TMHK7K" />
 
             <body
                 className={cn(

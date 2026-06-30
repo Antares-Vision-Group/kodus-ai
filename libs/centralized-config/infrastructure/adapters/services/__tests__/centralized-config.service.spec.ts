@@ -758,7 +758,7 @@ describe('CentralizedConfigService', () => {
                     type: 'file' as const,
                 },
                 {
-                    path: 'org-a/services/api/.kody-rules/review/api.yml',
+                    path: 'org-a/services%2Fapi/.kody-rules/review/api.yml',
                     type: 'file' as const,
                 },
             ];
@@ -783,6 +783,7 @@ describe('CentralizedConfigService', () => {
                         centralizedDirectoryPath: '.kody-rules/memories',
                         repositoryId: undefined,
                         directoryPath: undefined,
+                        directoryPaths: undefined,
                         ruleType: 'memory' as any,
                         ruleFilePath: '.kody-rules/memories/logging.yml',
                         path: '.kody-rules/memories/logging.yml',
@@ -791,6 +792,7 @@ describe('CentralizedConfigService', () => {
                         centralizedDirectoryPath: '.kody-rules/review',
                         repositoryId: undefined,
                         directoryPath: undefined,
+                        directoryPaths: undefined,
                         ruleType: 'standard' as any,
                         ruleFilePath: '.kody-rules/review/security.yml',
                         path: '.kody-rules/review/security.yml',
@@ -799,19 +801,21 @@ describe('CentralizedConfigService', () => {
                         centralizedDirectoryPath: 'org-a/.kody-rules/memories',
                         repositoryId: 'org-a-id',
                         directoryPath: undefined,
+                        directoryPaths: undefined,
                         ruleType: 'memory' as any,
                         ruleFilePath: 'org-a/.kody-rules/memories/auth.yml',
                         path: 'org-a/.kody-rules/memories/auth.yml',
                     },
                     {
                         centralizedDirectoryPath:
-                            'org-a/services/api/.kody-rules/review',
+                            'org-a/services%2Fapi/.kody-rules/review',
                         repositoryId: 'org-a-id',
                         directoryPath: '/services/api',
+                        directoryPaths: ['/services/api'],
                         ruleType: 'standard' as any,
                         ruleFilePath:
-                            'org-a/services/api/.kody-rules/review/api.yml',
-                        path: 'org-a/services/api/.kody-rules/review/api.yml',
+                            'org-a/services%2Fapi/.kody-rules/review/api.yml',
+                        path: 'org-a/services%2Fapi/.kody-rules/review/api.yml',
                     },
                 ]),
             );
@@ -985,6 +989,7 @@ describe('CentralizedConfigService', () => {
                     {
                         uuid: 'pending-rule-uuid',
                         status: 'pending',
+                        origin: 'past_reviews',
                         centralizedConfig: {
                             path: '.kody-rules/review/security.yml',
                             status: 'pending_edit',
@@ -1003,6 +1008,9 @@ describe('CentralizedConfigService', () => {
             });
 
             expect(result.success).toBe(true);
+            // Sync must NOT auto-approve a rule that is awaiting approval, and
+            // must not reclassify its origin — otherwise merging the
+            // centralized-config PR silently approves every pending rule.
             expect(
                 mockCreateOrUpdateKodyRulesUseCase.execute,
             ).toHaveBeenCalledWith(
@@ -1012,7 +1020,86 @@ describe('CentralizedConfigService', () => {
                         path: '.kody-rules/review/security.yml',
                         status: 'synced',
                     },
-                    status: 'active',
+                    status: 'pending',
+                    origin: 'past_reviews',
+                }),
+                'org-1',
+                expect.any(Object),
+                true,
+            );
+        });
+
+        it('should NOT resurrect a rejected rule when sourcePath matches', async () => {
+            const ruleFiles: any[] = [
+                {
+                    centralizedDirectoryPath: '.kody-rules/review',
+                    repositoryId: undefined,
+                    directoryPath: undefined,
+                    ruleType: 'standard' as any,
+                    ruleFilePath: '.kody-rules/review/rejected.yml',
+                    path: '.kody-rules/review/rejected.yml',
+                },
+            ];
+
+            const mockRuleContent = {
+                title: 'Rejected Rule',
+                rule: 'Should stay hidden',
+                examples: [],
+                inheritance: { inheritable: true, exclude: [], include: [] },
+            };
+
+            mockCodeManagementService.getRepositoryTree.mockResolvedValue([]);
+            mockCodeManagementService.getDefaultBranch.mockResolvedValue(
+                'main',
+            );
+            mockCodeManagementService.getRepositoryContentFile.mockResolvedValue(
+                {
+                    data: {
+                        content: Buffer.from(
+                            yaml.dump(mockRuleContent),
+                        ).toString('base64'),
+                        encoding: 'base64',
+                    },
+                },
+            );
+
+            mockParametersService.findByKey.mockResolvedValue({
+                configValue: {
+                    repository: { name: 'central-repo', id: 'central-repo-id' },
+                },
+            });
+
+            mockIntegrationConfigService.findIntegrationConfigFormatted.mockResolvedValue(
+                [],
+            );
+            mockKodyRulesService.findByOrganizationId.mockResolvedValue({
+                rules: [
+                    {
+                        uuid: 'rejected-rule-uuid',
+                        status: 'rejected',
+                        centralizedConfig: {
+                            path: '.kody-rules/review/rejected.yml',
+                            status: 'synced',
+                        },
+                    },
+                ],
+            });
+            mockCreateOrUpdateKodyRulesUseCase.execute.mockResolvedValue({
+                uuid: 'rejected-rule-uuid',
+            });
+
+            await service.synchronizeKodyRules({
+                organizationAndTeamData,
+                ruleFiles,
+                actor,
+            });
+
+            expect(
+                mockCreateOrUpdateKodyRulesUseCase.execute,
+            ).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    uuid: 'rejected-rule-uuid',
+                    status: 'rejected',
                 }),
                 'org-1',
                 expect.any(Object),
@@ -1177,6 +1264,52 @@ describe('CentralizedConfigService', () => {
             expect(
                 mockDeleteRuleInOrganizationByIdKodyRulesUseCase.execute,
             ).toHaveBeenCalledWith('pending-merge-rule-1', actor);
+        });
+
+        it('should NOT delete rules that were never part of the centralized config', async () => {
+            // Pending/rejected/manual rules have no centralizedConfig.path —
+            // they aren't exported, so the stale-cleanup must leave them alone
+            // instead of treating a missing path as "stale".
+            mockKodyRulesService.findByOrganizationId.mockResolvedValue({
+                toJson: () => ({
+                    rules: [
+                        { uuid: 'pending-rule', status: 'pending' },
+                        { uuid: 'rejected-rule', status: 'rejected' },
+                        {
+                            uuid: 'manual-rule',
+                            status: 'active',
+                            centralizedConfig: null,
+                        },
+                        {
+                            uuid: 'synced-rule',
+                            status: 'active',
+                            centralizedConfig: {
+                                path: '.kody-rules/review/kept.yml',
+                                status: 'synced',
+                            },
+                        },
+                    ],
+                }),
+            });
+
+            mockDeleteRuleInOrganizationByIdKodyRulesUseCase.execute.mockResolvedValue(
+                true,
+            );
+
+            const result = await service.removeStaleKodyRules({
+                organizationAndTeamData,
+                actor,
+                ruleFiles: [
+                    { path: '.kody-rules/review/kept.yml' } as any,
+                ],
+            });
+
+            expect(result.success).toBe(true);
+            // The synced rule is still present in the files → not deleted.
+            // None of the path-less rules are deleted either.
+            expect(
+                mockDeleteRuleInOrganizationByIdKodyRulesUseCase.execute,
+            ).not.toHaveBeenCalled();
         });
     });
 });

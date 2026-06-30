@@ -15,6 +15,10 @@ import {
     ReviewAgentInput,
     ReviewAgentOutput,
 } from './base-code-review-agent.provider';
+import {
+    dedupReviewWarnings,
+    type ReviewWarning,
+} from './llm/review-warnings';
 
 export interface OrchestratorInput extends ReviewAgentInput {
     reviewOptions: ReviewOptions;
@@ -33,6 +37,10 @@ export interface OrchestratorOutput {
     agentResults: ReviewAgentOutput[];
     failures: OrchestratorAgentFailure[];
     totalDurationMs: number;
+    /** Fidelity warnings collected across all per-agent fan-out, deduped
+     *  by (kind, modelName, contextWindowTokens). Empty array when no
+     *  adaptive strategy fired. */
+    warnings: ReviewWarning[];
 }
 
 /**
@@ -142,6 +150,7 @@ export class ReviewOrchestratorService {
                 agentResults: [],
                 failures: [],
                 totalDurationMs: Date.now() - startTime,
+                warnings: [],
             };
         }
 
@@ -172,6 +181,7 @@ export class ReviewOrchestratorService {
                     maxSteps: this.getMaxStepsForAgent(
                         task.name,
                         agentInput.reviewMode,
+                        agentInput.changedFiles?.length ?? 0,
                     ),
                 });
             } catch (error) {
@@ -249,17 +259,26 @@ export class ReviewOrchestratorService {
             },
         });
 
+        // Fold cross-agent warnings (same `kind` + model can fire on 4
+        // agents in parallel) into a single user-facing list before
+        // handing back to the stage.
+        const warnings = dedupReviewWarnings(
+            agentResults.flatMap((r) => r.warnings ?? []),
+        );
+
         return {
             suggestions: allSuggestions,
             agentResults,
             failures,
             totalDurationMs,
+            warnings,
         };
     }
 
     private getMaxStepsForAgent(
         agentName: string,
         reviewMode?: 'fast' | 'normal' | 'deep',
+        changedFilesCount = 0,
     ): number {
         if (reviewMode === 'deep') {
             return ReviewOrchestratorService.DEEP_MODE_MAX_STEPS;
@@ -271,7 +290,27 @@ export class ReviewOrchestratorService {
             );
         }
 
-        return ReviewOrchestratorService.NORMAL_MODE_MAX_STEPS[agentName] ?? 20;
+        const base =
+            ReviewOrchestratorService.NORMAL_MODE_MAX_STEPS[agentName] ?? 20;
+
+        // Adaptive step budget by PR size. A fixed budget spreads thin over
+        // large PRs (measured: recall on >500-line PRs drops to ~35% vs ~46%
+        // for medium), so the agent can't open enough files to investigate.
+        // Grant extra steps beyond a baseline file count, capped so cost/time
+        // stays bounded. Investigation-only lever: no prompt change, no new
+        // candidates generated — the same agent just gets to look deeper.
+        const BASELINE_FILES = 8; // ~median changed-files for this workload
+        const STEPS_PER_EXTRA_FILE = 0.5;
+        const ADAPTIVE_CAP = ReviewOrchestratorService.DEEP_MODE_MAX_STEPS; // 100
+
+        if (changedFilesCount <= BASELINE_FILES) {
+            return base;
+        }
+
+        const extra = Math.round(
+            (changedFilesCount - BASELINE_FILES) * STEPS_PER_EXTRA_FILE,
+        );
+        return Math.min(base + extra, ADAPTIVE_CAP);
     }
 
     /**
