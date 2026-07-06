@@ -26,6 +26,9 @@ export type BYOKConfig = {
      *  When set, takes precedence over reasoningEffort preset.
      *  Format: provider options object (e.g. {"budget_tokens": 25000}). */
     reasoningConfigOverride?: string;
+    /** OpenAI-compatible chat template thinking toggle. When false,
+     *  Kodus sends chat_template_kwargs.enable_thinking=false. */
+    enableThinking?: boolean;
     /** Pin OpenRouter requests to specific upstream providers (in order).
      *  Ignored when provider !== 'openrouter'. */
     openrouterProviderOrder?: string[];

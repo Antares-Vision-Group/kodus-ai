@@ -23,15 +23,27 @@ jest.mock('@ai-sdk/google-vertex/anthropic', () => ({
         })),
     ),
 }));
+jest.mock('@ai-sdk/openai-compatible', () => ({
+    createOpenAICompatible: jest.fn((settings: unknown) =>
+        jest.fn((modelId: string) => ({
+            sdk: 'openai-compatible',
+            modelId,
+            settings,
+        })),
+    ),
+}));
 // decrypt is identity in tests: the apiKey we pass IS the base64 SA JSON.
 jest.mock('@libs/common/utils/crypto', () => ({ decrypt: (v: string) => v }));
 
 import { createVertex } from '@ai-sdk/google-vertex';
 import { createVertexAnthropic } from '@ai-sdk/google-vertex/anthropic';
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { byokToVercelModel } from './byok-to-vercel';
 
 const createVertexMock = createVertex as unknown as jest.Mock;
 const createVertexAnthropicMock = createVertexAnthropic as unknown as jest.Mock;
+const createOpenAICompatibleMock =
+    createOpenAICompatible as unknown as jest.Mock;
 
 const SA_JSON_B64 = Buffer.from(
     JSON.stringify({
@@ -56,6 +68,7 @@ describe('byokToVercelModel — Google Vertex protocol routing', () => {
     beforeEach(() => {
         createVertexMock.mockClear();
         createVertexAnthropicMock.mockClear();
+        createOpenAICompatibleMock.mockClear();
     });
 
     it('routes a claude-* model id through createVertexAnthropic (Anthropic protocol)', () => {
@@ -111,5 +124,56 @@ describe('byokToVercelModel — Google Vertex protocol routing', () => {
                 location: 'global',
             }),
         );
+    });
+});
+
+describe('byokToVercelModel — OpenAI-compatible thinking toggle', () => {
+    beforeEach(() => {
+        createOpenAICompatibleMock.mockClear();
+    });
+
+    it('injects chat_template_kwargs.enable_thinking=false when configured', () => {
+        byokToVercelModel({
+            main: {
+                provider: BYOKProvider.OPENAI_COMPATIBLE,
+                apiKey: 'test-key',
+                model: 'coder',
+                baseURL: 'http://localhost:8000/v1',
+                enableThinking: false,
+            },
+        } as BYOKConfig);
+
+        expect(createOpenAICompatibleMock).toHaveBeenCalledTimes(1);
+        const providerSettings = createOpenAICompatibleMock.mock.calls[0][0] as {
+            transformRequestBody?: (body: Record<string, any>) => Record<string, any>;
+        };
+        expect(typeof providerSettings.transformRequestBody).toBe('function');
+
+        const transformed = providerSettings.transformRequestBody?.({
+            messages: [],
+            chat_template_kwargs: { existing: 'value' },
+        });
+
+        expect(transformed?.chat_template_kwargs).toEqual({
+            existing: 'value',
+            enable_thinking: false,
+        });
+    });
+
+    it('does not inject transformRequestBody when toggle is unset', () => {
+        byokToVercelModel({
+            main: {
+                provider: BYOKProvider.OPENAI_COMPATIBLE,
+                apiKey: 'test-key',
+                model: 'coder',
+                baseURL: 'http://localhost:8000/v1',
+            },
+        } as BYOKConfig);
+
+        expect(createOpenAICompatibleMock).toHaveBeenCalledTimes(1);
+        const providerSettings = createOpenAICompatibleMock.mock.calls[0][0] as {
+            transformRequestBody?: unknown;
+        };
+        expect(providerSettings.transformRequestBody).toBeUndefined();
     });
 });

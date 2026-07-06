@@ -51,6 +51,10 @@ export interface BYOKConfig {
         /** Raw JSON override for provider-specific reasoning config.
          *  When set, takes precedence over reasoningEffort preset. */
         reasoningConfigOverride?: string;
+        /** OpenAI-compatible chat template thinking toggle.
+         *  When false, Kodus sends chat_template_kwargs.enable_thinking=false
+         *  in requests (vLLM/Qwen-style endpoints). */
+        enableThinking?: boolean;
         temperature?: number;
         maxInputTokens?: number;
         maxConcurrentRequests?: number;
@@ -78,6 +82,7 @@ export interface BYOKConfig {
         maxInputTokens?: number;
         maxConcurrentRequests?: number;
         maxOutputTokens?: number;
+        enableThinking?: boolean;
         vertexLocation?: string;
         awsBearerToken?: string;
         awsAccessKeyId?: string;

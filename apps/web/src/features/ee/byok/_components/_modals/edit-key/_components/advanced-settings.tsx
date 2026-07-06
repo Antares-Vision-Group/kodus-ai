@@ -113,6 +113,7 @@ export const ByokAdvancedSettings = ({
     const currentEffort = watch("reasoningEffort");
     const isCustom = currentEffort === ("custom" as string);
     const currentProvider = watch("provider");
+    const isOpenAICompatible = currentProvider === "openai_compatible";
     const isOpenRouter = currentProvider === "open_router";
     const customPlaceholder = getCustomPlaceholder(currentProvider);
 
@@ -227,6 +228,38 @@ export const ByokAdvancedSettings = ({
                                 extended thinking, Gemini thinking level, OpenAI
                                 reasoning effort).
                             </p>
+                        )}
+
+                        {isOpenAICompatible && (
+                            <Controller
+                                name="enableThinking"
+                                control={control}
+                                render={({ field }) => (
+                                    <FormControl.Root>
+                                        <div className="flex items-center justify-between gap-4">
+                                            <div className="flex flex-col">
+                                                <FormControl.Label>
+                                                    Enable model thinking
+                                                </FormControl.Label>
+                                                <FormControl.Helper>
+                                                    OpenAI-compatible only. When
+                                                    disabled, Kodus sends{" "}
+                                                    <code>
+                                                        chat_template_kwargs.enable_thinking=false
+                                                    </code>
+                                                    .
+                                                </FormControl.Helper>
+                                            </div>
+                                            <Switch
+                                                checked={field.value ?? true}
+                                                onCheckedChange={(v) =>
+                                                    field.onChange(v)
+                                                }
+                                            />
+                                        </div>
+                                    </FormControl.Root>
+                                )}
+                            />
                         )}
                     </div>
 

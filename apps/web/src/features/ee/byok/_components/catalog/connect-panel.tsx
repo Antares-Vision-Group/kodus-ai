@@ -53,6 +53,7 @@ const buildConnectSchema = (hasExistingKey: boolean) =>
                 .nullable()
                 .optional(),
             reasoningConfigOverride: z.string().nullable().optional(),
+            enableThinking: z.boolean().nullable().optional(),
             openrouterProviderOrder: z.array(z.string()).nullable().optional(),
             openrouterAllowFallbacks: z.boolean().nullable().optional(),
         })
@@ -145,6 +146,7 @@ export function CuratedConnectPanel({
                   null,
             reasoningConfigOverride:
                 existingConfig?.reasoningConfigOverride ?? null,
+            enableThinking: existingConfig?.enableThinking ?? null,
             openrouterProviderOrder:
                 existingConfig?.openrouterProviderOrder ?? null,
             openrouterAllowFallbacks:
@@ -201,6 +203,11 @@ export function CuratedConnectPanel({
             reasoningConfigOverride:
                 effort === "custom"
                     ? (data.reasoningConfigOverride ?? undefined)
+                    : undefined,
+            enableThinking:
+                data.provider === "openai_compatible" &&
+                typeof data.enableThinking === "boolean"
+                    ? data.enableThinking
                     : undefined,
             openrouterProviderOrder:
                 data.provider === "open_router" &&

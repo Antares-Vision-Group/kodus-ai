@@ -246,6 +246,27 @@ function shouldEnableJsonSchema(
     return false;
 }
 
+function buildOpenAICompatibleThinkingTransform(enableThinking?: boolean) {
+    if (typeof enableThinking !== 'boolean') return undefined;
+
+    return (body: Record<string, any>) => {
+        const chatTemplateKwargs =
+            body?.chat_template_kwargs &&
+            typeof body.chat_template_kwargs === 'object' &&
+            !Array.isArray(body.chat_template_kwargs)
+                ? body.chat_template_kwargs
+                : {};
+
+        return {
+            ...body,
+            chat_template_kwargs: {
+                ...chatTemplateKwargs,
+                enable_thinking: enableThinking,
+            },
+        };
+    };
+}
+
 export function byokToVercelModel(
     byokConfig?: BYOKConfig,
     role: 'main' | 'fallback' = 'main',
@@ -429,7 +450,9 @@ export function byokToVercelModel(
                     shouldEnableJsonSchema(provider, model, baseURL),
             })(model);
 
-        case BYOKProvider.OPENAI_COMPATIBLE:
+        case BYOKProvider.OPENAI_COMPATIBLE: {
+            const transformRequestBody =
+                buildOpenAICompatibleThinkingTransform(config.enableThinking);
             return createOpenAICompatible({
                 name: 'openai-compatible',
                 apiKey,
@@ -437,7 +460,9 @@ export function byokToVercelModel(
                 supportsStructuredOutputs:
                     options.structuredOutputs === true &&
                     shouldEnableJsonSchema(provider, model, baseURL),
+                ...(transformRequestBody ? { transformRequestBody } : {}),
             })(model);
+        }
 
         case BYOKProvider.NOVITA:
             return createOpenAICompatible({

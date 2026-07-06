@@ -13,6 +13,7 @@ const baseFields = {
         .nullable()
         .optional(),
     reasoningConfigOverride: z.string().nullable().optional(),
+    enableThinking: z.boolean().nullable().optional(),
     openrouterProviderOrder: z.array(z.string()).nullable().optional(),
     openrouterAllowFallbacks: z.boolean().nullable().optional(),
     vertexLocation: z.string().trim().nullable().optional(),

@@ -114,6 +114,7 @@ export function ByokManualPageClient({
                 : existingConfig?.reasoningEffort ?? null,
             reasoningConfigOverride:
                 existingConfig?.reasoningConfigOverride ?? null,
+            enableThinking: existingConfig?.enableThinking ?? null,
             openrouterProviderOrder:
                 existingConfig?.openrouterProviderOrder ?? null,
             openrouterAllowFallbacks:
@@ -244,6 +245,11 @@ export function ByokManualPageClient({
             reasoningConfigOverride:
                 effort === "custom"
                     ? (data.reasoningConfigOverride ?? undefined)
+                    : undefined,
+            enableThinking:
+                data.provider === "openai_compatible" &&
+                typeof data.enableThinking === "boolean"
+                    ? data.enableThinking
                     : undefined,
             openrouterProviderOrder:
                 data.provider === "open_router" &&
