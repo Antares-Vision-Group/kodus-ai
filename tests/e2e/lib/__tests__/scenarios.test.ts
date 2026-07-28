@@ -10,16 +10,23 @@ test("allScenarios: includes the registered release-gate scenarios", () => {
         "code-review-basic",
         "code-review-vertex-byok",
         "command-review",
+        "command-review-focus",
         "conversation-anthropic-byok",
         "conversation-vertex-byok",
+        "finish-onboarding-slo",
+        "kody-rules-coverage",
         "kody-rules-create-and-apply",
+        "kody-rules-file-sync",
+        "kody-rules-lifecycle",
         "license-attribution",
         "onboarding-webhook-registration",
         "per-seat-license-toggle",
+        "pr-execution-sse",
         "public-pr-demo",
         "rbac-authorization",
         "rbac-frontend-routes",
         "rbac-ui-render",
+        "rule-file-detection",
         "sso-cookie-domain",
         "sso-multi-user",
         "stripe-billing",
@@ -56,6 +63,19 @@ test("command-review: cloud + self-hosted × github + github-app + 3 others × p
     ]);
     // `trial` moved to the dedicated trial-entitlement-gate scenario (a
     // standing trial expires after 14 days and broke this every release).
+    assert.deepEqual(s.appliesTo.license, ["paid", "license-paid"]);
+});
+
+test("command-review-focus: cloud + self-hosted × github + github-app + 3 others × paid/license-paid", () => {
+    const s = allScenarios["command-review-focus"];
+    assert.deepEqual(s.appliesTo.target, ["cloud", "self-hosted"]);
+    assert.deepEqual(s.appliesTo.provider, [
+        "github",
+        "github-app",
+        "gitlab",
+        "bitbucket",
+        "azure-devops",
+    ]);
     assert.deepEqual(s.appliesTo.license, ["paid", "license-paid"]);
 });
 

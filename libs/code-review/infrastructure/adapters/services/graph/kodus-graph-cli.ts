@@ -1,9 +1,9 @@
-import { createLogger } from '@kodus/flow';
+import { createLogger } from '@libs/core/log/logger';
 import { Injectable } from '@nestjs/common';
 import { SandboxInstance } from '@libs/sandbox/domain/contracts/sandbox.provider';
 import { shSingleQuote } from '../shell-quote';
 
-export const KODUS_GRAPH_VERSION = '0.2.19';
+export const KODUS_GRAPH_VERSION = '0.3.0';
 
 export const KODUS_GRAPH_TIMEOUTS = {
     install: 120_000,

@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { createLogger } from '@kodus/flow';
+import { createLogger } from '@libs/core/log/logger';
 import { promises as fsPromises } from 'fs';
 import * as yaml from 'js-yaml';
 
@@ -653,6 +653,16 @@ export class CentralizedConfigDownloadUseCase {
         }
 
         if (
+            message.errorReviewMessage &&
+            this.hasDefinedValues(message.errorReviewMessage)
+        ) {
+            customMessages.errorReviewMessage = {
+                content: message.errorReviewMessage.content,
+                status: message.errorReviewMessage.status,
+            };
+        }
+
+        if (
             message.globalSettings &&
             this.hasDefinedValues(message.globalSettings)
         ) {
@@ -677,6 +687,10 @@ export class CentralizedConfigDownloadUseCase {
 
         if (customMessages?.endReviewMessage) {
             normalized.endReviewMessage = customMessages.endReviewMessage;
+        }
+
+        if (customMessages?.errorReviewMessage) {
+            normalized.errorReviewMessage = customMessages.errorReviewMessage;
         }
 
         if (customMessages?.globalSettings) {

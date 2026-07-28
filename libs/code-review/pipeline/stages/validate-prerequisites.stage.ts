@@ -1,4 +1,4 @@
-import { createLogger } from '@kodus/flow';
+import { createLogger } from '@libs/core/log/logger';
 import {
     AutomationMessage,
     AutomationStatus,
@@ -20,6 +20,11 @@ import { StageVisibility } from '@libs/core/infrastructure/pipeline/enums/stage-
 import { PipelineReason } from '@libs/core/infrastructure/pipeline/interfaces/pipeline-reason.interface';
 import { IStageValidationResult } from '@libs/core/infrastructure/pipeline/interfaces/stage-result.interface';
 import { StageMessageHelper } from '@libs/core/infrastructure/pipeline/utils/stage-message.helper';
+import { environment } from '@libs/ee/configs/environment';
+import {
+    ILicenseService,
+    LICENSE_SERVICE_TOKEN,
+} from '@libs/ee/license/interfaces/license.interface';
 import { AutoAssignLicenseUseCase } from '@libs/ee/license/use-cases/auto-assign-license.use-case';
 import {
     PermissionValidationService,
@@ -102,6 +107,8 @@ export class ValidatePrerequisitesStage extends BasePipelineStage<CodeReviewPipe
         private readonly prAuthorRecipientResolver: PrAuthorRecipientResolver,
         @Inject(USER_SERVICE_TOKEN)
         private readonly usersService: IUsersService,
+        @Inject(LICENSE_SERVICE_TOKEN)
+        private readonly licenseService: ILicenseService,
     ) {
         super();
     }
@@ -204,20 +211,72 @@ export class ValidatePrerequisitesStage extends BasePipelineStage<CodeReviewPipe
             });
         }
 
+        const globalRulesSourceDisablesReviewForRepository =
+            await this.isGlobalRulesSourceRepositoryReviewDisabled(
+                organizationAndTeamData,
+                context.repository,
+            );
+
+        if (globalRulesSourceDisablesReviewForRepository) {
+            this.logger.log({
+                message:
+                    'Repository is a global Kody Rules source, skipping automation',
+                context: this.stageName,
+                metadata: {
+                    organizationAndTeamData,
+                    repositoryName: context.repository?.name,
+                    repositoryId: context.repository?.id,
+                    prNumber: pullRequest?.number,
+                },
+            });
+
+            return this.updateContext(context, (draft) => {
+                applyShowStatusFeedbackMetadata(draft);
+                draft.statusInfo = {
+                    status: AutomationStatus.SKIPPED,
+                    message:
+                        'Code reviews are disabled for the global Kody Rules source repository',
+                };
+            });
+        }
+
         // Centralized permission validation
-        const validationResult =
+        const validationOptions = {
+            consumeTrialReviewCredit: true,
+            trialReviewCreditUsageKey:
+                context.repository?.id && pullRequest?.number
+                    ? `${context.repository.id}:${pullRequest.number}`
+                    : undefined,
+        };
+
+        let validationResult =
             await this.permissionValidationService.validateExecutionPermissions(
                 organizationAndTeamData,
                 userGitId,
                 ValidatePrerequisitesStage.name,
-                {
-                    consumeTrialReviewCredit: true,
-                    trialReviewCreditUsageKey:
-                        context.repository?.id && pullRequest?.number
-                            ? `${context.repository.id}:${pullRequest.number}`
-                            : undefined,
-                },
+                validationOptions,
             );
+
+        // Safety net for the "onboarded but never got a trial" gap: the trial
+        // was historically created only by the browser at the end of
+        // onboarding, so a closed tab or a silent billing failure could leave
+        // a fully-onboarded org without any license. If the org has no valid
+        // license yet its onboarding is complete, provision the trial now and
+        // re-validate so this very review can proceed instead of posting a
+        // "your trial has ended" comment.
+        if (
+            !validationResult.allowed &&
+            validationResult.errorType === ValidationErrorType.INVALID_LICENSE &&
+            (await this.tryHealMissingTrial(context))
+        ) {
+            validationResult =
+                await this.permissionValidationService.validateExecutionPermissions(
+                    organizationAndTeamData,
+                    userGitId,
+                    ValidatePrerequisitesStage.name,
+                    validationOptions,
+                );
+        }
 
         if (
             validationResult.allowed ||
@@ -457,6 +516,77 @@ export class ValidatePrerequisitesStage extends BasePipelineStage<CodeReviewPipe
         return 'failed';
     }
 
+    /**
+     * Provision a missing trial for an org that finished onboarding but was
+     * left without a license. Cloud-only, idempotent and best-effort: any
+     * failure leaves the original INVALID_LICENSE result untouched so the
+     * normal "no active subscription" handling still runs.
+     *
+     * Returns true when a trial is in place after the call (so the caller
+     * should re-validate).
+     */
+    private async tryHealMissingTrial(
+        context: CodeReviewPipelineContext,
+    ): Promise<boolean> {
+        try {
+            if (!environment.API_CLOUD_MODE) {
+                return false;
+            }
+
+            const { organizationAndTeamData } = context;
+
+            const onboardingFinished = await this.hasFinishedOnboarding(
+                organizationAndTeamData,
+            );
+
+            if (!onboardingFinished) {
+                return false;
+            }
+
+            const byokConfig =
+                await this.permissionValidationService.getBYOKConfig(
+                    organizationAndTeamData,
+                );
+
+            const provisioned = await this.licenseService.startTrial(
+                organizationAndTeamData,
+                Boolean(byokConfig?.main),
+            );
+
+            if (provisioned) {
+                this.logger.log({
+                    message:
+                        'Auto-provisioned missing trial for onboarded org at review time',
+                    context: this.stageName,
+                    metadata: { organizationAndTeamData },
+                });
+            }
+
+            return provisioned;
+        } catch (error) {
+            this.logger.warn({
+                message: 'Failed to auto-provision missing trial at review time',
+                context: this.stageName,
+                error,
+                metadata: {
+                    organizationAndTeamData: context.organizationAndTeamData,
+                },
+            });
+            return false;
+        }
+    }
+
+    private async hasFinishedOnboarding(
+        organizationAndTeamData: OrganizationAndTeamData,
+    ): Promise<boolean> {
+        const platformConfig = await this.parametersService.findByKey(
+            ParametersKey.PLATFORM_CONFIGS,
+            organizationAndTeamData,
+        );
+
+        return platformConfig?.configValue?.finishOnboard === true;
+    }
+
     private async isShowStatusFeedbackEnabled(
         context: CodeReviewPipelineContext,
     ): Promise<boolean> {
@@ -583,6 +713,67 @@ export class ValidatePrerequisitesStage extends BasePipelineStage<CodeReviewPipe
             this.logger.warn({
                 message:
                     'Error resolving centralized config repository review exclusion',
+                context: this.stageName,
+                error,
+                metadata: {
+                    organizationAndTeamData,
+                    repositoryId: repository?.id,
+                    repositoryName: repository?.name,
+                },
+            });
+        }
+
+        return false;
+    }
+
+    /**
+     * A repository selected purely as a source of GLOBAL Kody Rules is a
+     * config/data repository, not a codebase to review — mirror the
+     * centralized-config behaviour and skip the automation for its PRs.
+     */
+    private async isGlobalRulesSourceRepositoryReviewDisabled(
+        organizationAndTeamData: OrganizationAndTeamData,
+        repository?: { id?: string; name?: string },
+    ): Promise<boolean> {
+        try {
+            if (!repository?.id) {
+                return false;
+            }
+
+            const globalRulesSourceParameter =
+                await this.organizationParametersService.findByKey(
+                    OrganizationParametersKey.GLOBAL_RULES_SOURCE_REPOSITORIES,
+                    organizationAndTeamData,
+                );
+
+            const repositories =
+                globalRulesSourceParameter?.configValue?.repositories;
+
+            if (!Array.isArray(repositories) || repositories.length === 0) {
+                return false;
+            }
+
+            const isSource = repositories.some(
+                (r) => String(r?.id) === String(repository.id),
+            );
+
+            if (isSource) {
+                this.logger.log({
+                    message: 'Global Kody Rules source repository identified',
+                    context: this.stageName,
+                    metadata: {
+                        organizationAndTeamData,
+                        repositoryName: repository.name,
+                        repositoryId: repository.id,
+                    },
+                });
+            }
+
+            return isSource;
+        } catch (error) {
+            this.logger.warn({
+                message:
+                    'Error resolving global Kody Rules source repository review exclusion',
                 context: this.stageName,
                 error,
                 metadata: {
@@ -873,8 +1064,30 @@ export class ValidatePrerequisitesStage extends BasePipelineStage<CodeReviewPipe
             const { pullRequest, organizationAndTeamData, repository } =
                 context;
             const author = pullRequest?.user as
-                | { email?: string; username?: string }
+                | {
+                      email?: string;
+                      username?: string;
+                      login?: string;
+                      nickname?: string;
+                      uniqueName?: string;
+                      descriptor?: string;
+                  }
                 | undefined;
+
+            // Resolve the author handle with the SAME field precedence used to
+            // persist `user.username` in the pullRequests collection
+            // (PullRequestsService.extractUser), applied to the same
+            // `pullRequest.user` object. Keeping these aligned guarantees the
+            // notification shows exactly the handle we already store, for every
+            // platform: GitHub `login`, GitLab/Bitbucket-DC `username`,
+            // Bitbucket-Cloud `nickname`, Azure `uniqueName` (its UPN).
+            const authorUsername =
+                author?.login ||
+                author?.username ||
+                author?.nickname ||
+                author?.uniqueName ||
+                author?.descriptor ||
+                undefined;
 
             const authorRecipient =
                 await this.prAuthorRecipientResolver.resolve(
@@ -920,6 +1133,7 @@ export class ValidatePrerequisitesStage extends BasePipelineStage<CodeReviewPipe
                     prUrl: (pullRequest?.url as string) ?? '',
                     repoName: repository?.name ?? '',
                     ownerContact,
+                    authorUsername,
                 },
                 organizationId: organizationAndTeamData.organizationId,
                 recipients,

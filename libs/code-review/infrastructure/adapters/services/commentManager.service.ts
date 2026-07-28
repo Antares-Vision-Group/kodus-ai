@@ -41,15 +41,19 @@ import {
 import { ObservabilityService } from '@libs/core/log/observability.service';
 import { CodeManagementService } from '@libs/platform/infrastructure/adapters/services/codeManagement.service';
 import { CodeReviewPipelineContext } from '@libs/code-review/pipeline/context/code-review-pipeline.context';
-import { byokToVercelModel } from '@libs/code-review/infrastructure/agents/llm/byok-to-vercel';
-import { tracedGenerateText } from '@libs/code-review/infrastructure/agents/llm/agent-loop';
+import { byokToVercelModel } from '@libs/llm/byok-to-vercel';
+import {
+    attachClassification,
+    classifyLLMError,
+} from '@libs/llm/error-classifier';
+import { tracedGenerateText } from '@libs/llm/llm-call';
 import { buildLangfuseTelemetry } from '@libs/core/log/langfuse';
 import {
     getTranslationsForLanguageByCategory,
     TranslationsCategory,
 } from '@libs/common/utils/translations/translations';
 import { prompt_repeated_suggestion_clustering_system } from '@libs/common/utils/langchainCommon/prompts/repeatedCodeReviewSuggestionClustering';
-import { createLogger } from '@kodus/flow';
+import { createLogger } from '@libs/core/log/logger';
 import { DeliveryStatus } from '@libs/platformData/domain/pullRequests/enums/deliveryStatus.enum';
 import { PriorityStatus } from '@libs/platformData/domain/pullRequests/enums/priorityStatus.enum';
 import { estimateTokens, tokensToChars } from './utils/token-estimator';
@@ -83,8 +87,8 @@ export class CommentManagerService implements ICommentManagerService {
      * SDK) path so the user's BYOK model — including Claude-on-Vertex — is
      * honored. The legacy v2 langchain path (PromptRunnerService) only spoke
      * Gemini on Vertex, so a Claude-on-Vertex BYOK crashed the summary step
-     * before suggestions could be posted. Falls back to gemini-2.5-flash when
-     * no BYOK is configured (cloud default), matching the previous behavior.
+     * before suggestions could be posted. Defaults to kimi-k2.7-code (Moonshot)
+     * when no BYOK is configured (cloud/trial default).
      */
     private async runSummaryPromptV5(params: {
         byokConfig: BYOKConfig | null;
@@ -109,35 +113,45 @@ export class CommentManagerService implements ICommentManagerService {
             metadata,
         } = params;
 
-        const { result } = await this.observabilityService.runLLMInSpan<string>(
-            {
-                spanName,
-                runName,
-                attrs,
-                byokConfig: byokConfig ?? undefined,
-                exec: async () => {
-                    const model = byokToVercelModel(
-                        byokConfig ?? undefined,
-                        'main',
-                        {},
-                        'gemini-2.5-flash',
-                    );
-                    const res: any = await tracedGenerateText({
-                        model: model as any,
-                        system: systemPrompt,
-                        prompt: userPrompt,
-                        temperature: byokConfig?.main?.temperature ?? 0,
-                        experimental_telemetry: buildLangfuseTelemetry(
-                            runName,
-                            metadata,
-                        ),
-                    });
-                    return (res?.text as string) ?? '';
-                },
+        // This is an AI SDK call (tracedGenerateText), so use runAiSdkLLMInSpan —
+        // it reads token usage from result.usage. runLLMInSpan is the
+        // LangChain-callback path (TokenTrackingHandler) and can't see AI SDK
+        // usage, which is why summary spans were recorded with 0 tokens.
+        const result = await this.observabilityService.runAiSdkLLMInSpan<any>({
+            spanName,
+            runName,
+            model: byokConfig?.main?.model ?? 'kimi-k2.7-code',
+            attrs,
+            exec: async () => {
+                const model = byokToVercelModel(
+                    byokConfig ?? undefined,
+                    'main',
+                    {},
+                    'kimi-k2.7-code',
+                );
+                // Only pin temperature when the BYOK config sets one. Forcing 0
+                // broke models that reject a non-default temperature — Moonshot's
+                // kimi-k2.7-code rejects anything but 1 (HTTP 400), so the summary
+                // silently failed for kimi users while reviews kept working. The
+                // finder omits temperature for the same reason (finder.agent.ts),
+                // letting the provider default apply.
+                const configuredTemperature = byokConfig?.main?.temperature;
+                return await tracedGenerateText({
+                    model: model as any,
+                    system: systemPrompt,
+                    prompt: userPrompt,
+                    ...(configuredTemperature !== undefined
+                        ? { temperature: configuredTemperature }
+                        : {}),
+                    experimental_telemetry: buildLangfuseTelemetry(
+                        runName,
+                        metadata,
+                    ),
+                });
             },
-        );
+        });
 
-        return result;
+        return (result?.text as string) ?? '';
     }
 
     async generateSummaryPR(
@@ -173,6 +187,23 @@ export class CommentManagerService implements ICommentManagerService {
                 await this.permissionValidationService.getBYOKConfig(
                     organizationAndTeamData,
                 );
+        }
+
+        // Resolve the org's BYOK when the caller didn't pass one (the review
+        // flow passes codeReviewConfig.byokConfig, which can be null even when
+        // the org has BYOK). Without this, the summary falls to the internal
+        // default provider — which hard-fails when that provider is blocked
+        // (e.g. "project denied access") — while the review agents, which
+        // resolve BYOK themselves, keep working. Fetch the same BYOK they use.
+        if (!byokConfigValue) {
+            try {
+                byokConfigValue =
+                    (await this.permissionValidationService.getBYOKConfig(
+                        organizationAndTeamData,
+                    )) ?? null;
+            } catch {
+                byokConfigValue = null;
+            }
         }
 
         const maxRetries = 2;
@@ -583,7 +614,23 @@ You must always respond in ${languageResultPrompt}.`;
                         error,
                         metadata: { organizationAndTeamData, pullRequest },
                     });
-                    return null;
+                    // Throw, don't `return null`. `null` is the return value for
+                    // the DELIBERATE skips above (summary disabled, license
+                    // denied, diff too large), so returning it here made a dead
+                    // provider indistinguishable from a config decision — the
+                    // caller recorded no pipeline error and the review was
+                    // auto-approved as if the code were clean (#1568).
+                    throw attachClassification(
+                        error instanceof Error
+                            ? error
+                            : new Error(String(error)),
+                        classifyLLMError(
+                            error,
+                            byokConfigValue?.main?.provider as
+                                | string
+                                | undefined,
+                        ),
+                    );
                 }
             }
         }
@@ -791,6 +838,7 @@ You must always respond in ${languageResultPrompt}.`;
         codeReviewConfig?: CodeReviewConfig,
         language?: string,
         platformType?: PlatformType,
+        lineComments?: CommentResult[],
     ): Promise<string> {
         const placeholderContext = await this.getTemplateContext(
             changedFiles,
@@ -799,6 +847,7 @@ You must always respond in ${languageResultPrompt}.`;
             codeReviewConfig,
             language,
             platformType,
+            lineComments,
         );
 
         const processedBody = await this.messageProcessor.processTemplate(
@@ -824,6 +873,7 @@ You must always respond in ${languageResultPrompt}.`;
         reviewFailed?: boolean,
         reviewErrorMessage?: string,
         reviewHasPartialErrors?: boolean,
+        reviewErrorCustomMessage?: string,
     ): Promise<void> {
         try {
             // When the review failed, we cannot honor a customer-configured
@@ -843,6 +893,7 @@ You must always respond in ${languageResultPrompt}.`;
                     reviewFailed,
                     reviewErrorMessage,
                     reviewHasPartialErrors,
+                    reviewErrorCustomMessage,
                 );
             } else if (reviewHasPartialErrors) {
                 // Custom end-review template is rendering — the default
@@ -913,6 +964,7 @@ You must always respond in ${languageResultPrompt}.`;
         reviewFailed?: boolean,
         reviewErrorMessage?: string,
         reviewHasPartialErrors?: boolean,
+        reviewErrorCustomMessage?: string,
     ): Promise<string> {
         let commentBody = await this.generatePullRequestFinishSummaryMarkdown(
             organizationAndTeamData,
@@ -923,6 +975,7 @@ You must always respond in ${languageResultPrompt}.`;
             reviewFailed,
             reviewErrorMessage,
             reviewHasPartialErrors,
+            reviewErrorCustomMessage,
         );
 
         commentBody = this.sanitizeBitbucketMarkdown(commentBody, platformType);
@@ -1486,6 +1539,7 @@ You must always respond in ${languageResultPrompt}.`;
         reviewFailed?: boolean,
         reviewErrorMessage?: string,
         reviewHasPartialErrors?: boolean,
+        reviewErrorCustomMessage?: string,
     ): Promise<string> {
         try {
             const language =
@@ -1535,6 +1589,21 @@ You must always respond in ${languageResultPrompt}.`;
                         /\{\{errorMessage\}\}/g,
                         errorMessage,
                     );
+
+                    // Optional team-authored note appended below Kody's default
+                    // error comment (issue #1452). The technical reason above is
+                    // always preserved; this is only the org-specific next step
+                    // (e.g. "reach out to #devops"). Single newlines collapse in
+                    // Markdown, so we convert each to a hard break (two trailing
+                    // spaces) — what the author typed is what renders in the PR.
+                    const customError = reviewErrorCustomMessage?.trim();
+                    if (customError) {
+                        const withLineBreaks = customError.replace(
+                            /\n/g,
+                            '  \n',
+                        );
+                        resultText = `${resultText}\n\n${withLineBreaks}`;
+                    }
                 }
             }
 
@@ -2364,6 +2433,7 @@ ${reviewOptions}
         reviewFailed?: boolean,
         reviewErrorMessage?: string,
         reviewHasPartialErrors?: boolean,
+        reviewErrorCustomMessage?: string,
     ): Promise<void> {
         let commentBody: string;
 
@@ -2413,6 +2483,7 @@ ${reviewOptions}
                 reviewFailed,
                 reviewErrorMessage,
                 reviewHasPartialErrors,
+                reviewErrorCustomMessage,
             );
         }
 
@@ -2450,6 +2521,7 @@ ${reviewOptions}
         codeReviewConfig?: CodeReviewConfig,
         language?: string,
         platformType?: PlatformType,
+        lineComments?: CommentResult[],
     ): Promise<PlaceholderContext> {
         return {
             changedFiles,
@@ -2458,6 +2530,7 @@ ${reviewOptions}
             codeReviewConfig,
             language,
             platformType,
+            lineComments,
         };
     }
 

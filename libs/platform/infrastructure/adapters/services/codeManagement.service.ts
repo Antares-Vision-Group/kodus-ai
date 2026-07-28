@@ -1,4 +1,4 @@
-import { createLogger } from '@kodus/flow';
+import { createLogger } from '@libs/core/log/logger';
 import { Inject, Injectable, forwardRef } from '@nestjs/common';
 
 import { Reaction } from '@libs/code-review/domain/codeReviewFeedback/enums/codeReviewCommentReaction.enum';
@@ -1014,6 +1014,15 @@ export class CodeManagementService implements ICodeManagementService {
             type = await this.getTypeIntegration(
                 extractOrganizationAndTeamData(params),
             );
+        }
+
+        // Same guard the list-returning methods here already apply: with no
+        // integration, getTypeIntegration answers null and the factory would
+        // throw "Repository service for type 'null' not found". Callers already
+        // treat a null result as "no clone params" — the adapters return null
+        // on failure too.
+        if (!type) {
+            return null;
         }
 
         const codeManagementService =

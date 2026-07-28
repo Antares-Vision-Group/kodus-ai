@@ -9,7 +9,7 @@ import {
 import { AstGraphStatus } from '@libs/code-review/infrastructure/adapters/repositories/schemas/repository.model';
 import { SandboxInstance } from '@libs/sandbox/domain/contracts/sandbox.provider';
 
-jest.mock('@kodus/flow', () => ({
+jest.mock('@libs/core/log/logger', () => ({
     createLogger: () => ({
         log: jest.fn(),
         error: jest.fn(),
@@ -141,7 +141,7 @@ describe('GraphIndexerService', () => {
         it('should find preinstalled kodus-graph through the Bun global bin path', async () => {
             mockSandbox.run
                 .mockResolvedValueOnce({
-                    stdout: '/home/node/.bun/bin/kodus-graph\n0.2.19',
+                    stdout: '/home/node/.bun/bin/kodus-graph\n0.3.0',
                     stderr: '',
                     exitCode: 0,
                 })

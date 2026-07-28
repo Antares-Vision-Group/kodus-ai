@@ -13,7 +13,7 @@ import * as moment from 'moment-timezone';
 import pLimit from 'p-limit';
 import { v4 as uuidv4 } from 'uuid';
 
-import { createLogger } from '@kodus/flow';
+import { createLogger } from '@libs/core/log/logger';
 import {
     GitHubReaction,
     Reaction,
@@ -1359,6 +1359,22 @@ export class GithubService
         });
     }
 
+    // `User.suspendedAt` only exists on GitHub Enterprise schemas — on
+    // github.com every batch fails with "Field 'suspendedAt' doesn't exist"
+    // and we were re-issuing (and error-logging) the doomed query on every
+    // member listing. Remember the schema verdict PER API BASE URL: the
+    // schema is a property of the GitHub instance, and a process-wide flag
+    // would let a github.com org disable the (real) suspension check for a
+    // GHE org served by the same service instance.
+    private suspendedAtUnsupportedByBaseUrl = new Map<string, boolean>();
+
+    private graphqlBaseUrlOf(octokit: Octokit): string {
+        return (
+            (octokit as any)?.request?.endpoint?.DEFAULTS?.baseUrl ??
+            'https://api.github.com'
+        );
+    }
+
     private async getSuspendedStatusBatch(
         octokit: Octokit,
         logins: string[],
@@ -1367,6 +1383,13 @@ export class GithubService
         if (logins.length === 0) return new Map();
 
         const statusMap = new Map<string, boolean>();
+
+        const baseUrl = this.graphqlBaseUrlOf(octokit);
+        if (this.suspendedAtUnsupportedByBaseUrl.get(baseUrl)) {
+            logins.forEach((login) => statusMap.set(login, true));
+            return statusMap;
+        }
+
         let aliasCounter = 0;
 
         for (let i = 0; i < logins.length; i += batchSize) {
@@ -1394,6 +1417,19 @@ export class GithubService
                     statusMap.set(login, userData?.suspendedAt === null);
                 });
             } catch (error) {
+                const message =
+                    error instanceof Error ? error.message : String(error);
+                if (/'suspendedAt' doesn't exist/.test(message)) {
+                    this.suspendedAtUnsupportedByBaseUrl.set(baseUrl, true);
+                    this.logger.warn({
+                        message:
+                            "GraphQL schema has no User.suspendedAt (github.com) — treating all members as active and skipping future suspended-status batches for this API base URL",
+                        context: GithubService.name,
+                        metadata: { baseUrl },
+                    });
+                    logins.forEach((login) => statusMap.set(login, true));
+                    return statusMap;
+                }
                 this.logger.error({
                     message: 'GraphQL batch query failed for suspended status',
                     context: GithubService.name,
@@ -5350,8 +5386,20 @@ This is an experimental feature that generates committable changes. Review the d
 
         try {
             for (const repo of repositories) {
+                // The hook lives under the REPO's namespace, not the
+                // integration account's. getCorrectOwner resolves personal
+                // PAT integrations to the authenticated user's login, which
+                // 404s ("Not Found - list-repository-webhooks") for every
+                // repo the account merely collaborates on — the whole
+                // registerRepo call then fails. Prefer the owner recorded on
+                // the repository itself; keep getCorrectOwner as a fallback
+                // for legacy configs missing both fields.
+                const repoOwner =
+                    repo.full_name?.split('/')[0] ||
+                    repo.organizationName ||
+                    owner;
                 const { data: webhooks } = await octokit.repos.listWebhooks({
-                    owner: owner,
+                    owner: repoOwner,
                     repo: repo.name,
                 });
 
@@ -5362,14 +5410,14 @@ This is an experimental feature that generates committable changes. Review the d
 
                 if (webhookToDelete) {
                     await octokit.repos.deleteWebhook({
-                        owner: owner,
+                        owner: repoOwner,
                         repo: repo.name,
                         hook_id: webhookToDelete.id,
                     });
                 }
 
                 const response = await octokit.repos.createWebhook({
-                    owner: owner,
+                    owner: repoOwner,
                     repo: repo.name,
                     config: {
                         url: webhookUrl,
@@ -5387,11 +5435,11 @@ This is an experimental feature that generates committable changes. Review the d
                 });
 
                 this.logger.log({
-                    message: `Webhook adicionado ao repositório ${repo.name} (owner: ${owner})`,
+                    message: `Webhook adicionado ao repositório ${repo.name} (owner: ${repoOwner})`,
                     context: GithubService.name,
                     metadata: {
                         ...params,
-                        owner,
+                        owner: repoOwner,
                         repositoryName: repo.name,
                         webhookId: response?.data?.id,
                     },
@@ -6014,7 +6062,16 @@ This is an experimental feature that generates committable changes. Review the d
                 params.organizationAndTeamData,
             );
 
-            if (!githubAuthDetail) {
+            // getGithubAuthDetails always returns a truthy object (it spreads
+            // the lookup and defaults authMode), so a plain `!githubAuthDetail`
+            // check never fires for an org with no GitHub integration. Assert
+            // on the auth material instead: without it we would build a
+            // github.com URL with an empty token and let the caller clone from
+            // the wrong host (#1541).
+            if (
+                !githubAuthDetail?.authToken &&
+                !githubAuthDetail?.installationId
+            ) {
                 throw new BadRequestException('Instalation not found');
             }
 
@@ -6475,34 +6532,47 @@ This is an experimental feature that generates committable changes. Review the d
 
             const octokit = await this.instanceOctokit(organizationAndTeamData);
 
-            const pullRequests = await octokit.paginate(octokit.pulls.list, {
-                owner: githubAuthDetail.org,
-                repo: repository.name,
-                state: 'all',
-                sort: 'created',
-                direction: 'desc',
-                per_page: 100,
-            });
+            const startTime = filters?.startDate
+                ? new Date(filters.startDate).getTime()
+                : null;
+            const endTime = filters?.endDate
+                ? new Date(filters.endDate).getTime()
+                : null;
 
-            return pullRequests
-                .filter((pr) => {
-                    const prDate = moment(pr.created_at);
-                    const startDate = filters?.startDate
-                        ? moment(filters.startDate)
-                        : null;
-                    const endDate = filters?.endDate
-                        ? moment(filters.endDate)
-                        : null;
+            // The list comes back sorted by created_at desc, so once we hit a PR
+            // older than startDate every remaining page is older too — stop
+            // paginating instead of pulling the whole repo history into memory
+            // (dozens of useless pages on large repos) just to filter by date.
+            const pullRequests = await octokit.paginate(
+                octokit.pulls.list,
+                {
+                    owner: githubAuthDetail.org,
+                    repo: repository.name,
+                    state: 'all',
+                    sort: 'created',
+                    direction: 'desc',
+                    per_page: 100,
+                },
+                (response, done) => {
+                    const inWindow: typeof response.data = [];
+                    for (const pr of response.data) {
+                        const prTime = new Date(pr.created_at).getTime();
+                        if (startTime !== null && prTime < startTime) {
+                            done();
+                            break;
+                        }
+                        if (endTime !== null && prTime > endTime) {
+                            continue;
+                        }
+                        inWindow.push(pr);
+                    }
+                    return inWindow;
+                },
+            );
 
-                    return (
-                        (!startDate ||
-                            prDate.isSameOrAfter(startDate, 'day')) &&
-                        (!endDate || prDate.isSameOrBefore(endDate, 'day'))
-                    );
-                })
-                .map((pr) =>
-                    this.transformPullRequest(pr, organizationAndTeamData),
-                );
+            return pullRequests.map((pr) =>
+                this.transformPullRequest(pr, organizationAndTeamData),
+            );
         } catch (error) {
             this.logger.error({
                 message: 'Error to get pull requests by repository',

@@ -8,6 +8,8 @@ import {
     IContextResolutionService,
 } from '@libs/core/context-resolution/domain/contracts/context-resolution.service.contract';
 import { STATUS } from '@libs/core/infrastructure/config/types/database/status.type';
+import { PermissionValidationService } from '@libs/ee/shared/services/permissionValidation.service';
+import { KODY_RULE_DETECTOR_COMPILER_TOKEN } from '@libs/kodyRules/domain/contracts/kody-rule-detector-compiler.contract';
 import { PERMISSIONS_SERVICE_TOKEN } from '@libs/identity/domain/permissions/contracts/permissions.service.contract';
 import { Role } from '@libs/identity/domain/permissions/enums/permissions.enum';
 import { AuthorizationService } from '@libs/identity/infrastructure/adapters/services/permissions/authorization.service';
@@ -23,7 +25,7 @@ import {
     KodyRulesType,
 } from '@libs/kodyRules/domain/interfaces/kodyRules.interface';
 
-jest.mock('@kodus/flow', () => ({
+jest.mock('@libs/core/log/logger', () => ({
     createLogger: () => ({
         log: jest.fn(),
         error: jest.fn(),
@@ -147,6 +149,23 @@ describe('CreateOrUpdateKodyRulesUseCase — inheritance toggle authz', () => {
                 {
                     provide: CentralizedConfigPrService,
                     useValue: centralizedConfigPrServiceMock,
+                },
+                {
+                    provide: PermissionValidationService,
+                    useValue: {
+                        getBYOKConfig: jest.fn().mockResolvedValue(null),
+                        getSubscriptionStatus: jest
+                            .fn()
+                            .mockResolvedValue(undefined),
+                    },
+                },
+                {
+                    provide: KODY_RULE_DETECTOR_COMPILER_TOKEN,
+                    useValue: {
+                        compileAndSave: jest
+                            .fn()
+                            .mockResolvedValue(undefined),
+                    },
                 },
             ],
         }).compile();

@@ -42,6 +42,7 @@ export type OrganizationLicenseValidationResult = {
 
 export type UserWithLicense = {
     git_id: string;
+    status?: 'active' | 'inactive';
 };
 
 export type TrialUnlock = {
@@ -88,6 +89,16 @@ export interface ILicenseService {
     ): Promise<UserWithLicense[]>;
 
     /**
+     * Get all users ever assigned a license (including inactive).
+     *
+     * @param params Organization ID and team ID.
+     * @returns Promise with array of all users ever assigned a license.
+     */
+    getAllUsersEverWithLicense(
+        organizationAndTeamData: OrganizationAndTeamData,
+    ): Promise<UserWithLicense[]>;
+
+    /**
      * Assign license to a user.
      *
      * @param organizationAndTeamData Organization ID and team ID.
@@ -111,4 +122,20 @@ export interface ILicenseService {
         organizationAndTeamData: OrganizationAndTeamData,
         usageKey?: string,
     ): Promise<ConsumeTrialReviewCreditResult>;
+
+    /**
+     * Provision a Kodus-managed trial for the organization.
+     *
+     * Idempotent: the billing service returns 409 when a license already
+     * exists, which is treated as success. Returns true when a trial is in
+     * place after the call (created now or already present), false when it
+     * could not be provisioned. Trials are a cloud-only concept.
+     *
+     * @param organizationAndTeamData Organization ID and team ID.
+     * @param byok Whether the org connected its own AI key during onboarding.
+     */
+    startTrial(
+        organizationAndTeamData: OrganizationAndTeamData,
+        byok: boolean,
+    ): Promise<boolean>;
 }

@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import NextLink from "next/link";
 import { useSearchParams } from "next/navigation";
-import { Spinner } from "@components/ui/spinner";
+import { Skeleton } from "@components/ui/skeleton";
 import {
     useInfinitePullRequestExecutions,
     usePullRequestFiles,
@@ -13,34 +13,95 @@ import {
     type PullRequestFile,
 } from "@services/pull-requests";
 import { ArrowLeftIcon } from "lucide-react";
-import { useSelectedTeamId } from "src/core/providers/selected-team-context";
-
 // Review screen — ported from the `try` app: a max-w page that scrolls as a
 // whole, with sticky left (file tree) and right (issues/metadata) rails and a
 // center column carrying the PR header + diff.
 import { ErrorBoundary, type FallbackProps } from "react-error-boundary";
+import { useSelectedTeamId } from "src/core/providers/selected-team-context";
 
 import { DiffViewer } from "./diff-viewer";
 import { ReviewStateProvider, useReviewStore } from "./review-store";
 import { adaptForTryDiffViewer, buildHeaderPrInfo } from "./try-port/adapt";
 import { CommitsList } from "./try-port/CommitsList";
-import { FileTree } from "./try-port/FileTree";
+import { FileTree, type FileTreeMode } from "./try-port/FileTree";
 import { PrHeader, type PrTab } from "./try-port/PrHeader";
 import { RightSidebar } from "./try-port/RightSidebar";
+import type { ReviewIssue } from "./try-port/types";
 
 // Web only carries data for these two tabs (Kody doesn't store the PR body
 // or comment threads), so we render a narrower tab bar than try's four.
 const WEB_TABS: PrTab[] = ["review", "commits"];
+const FILE_TREE_MODE_KEY = "kodus:pr-file-tree-mode";
 
 function PanelError({ error }: FallbackProps) {
     const message =
         error instanceof Error ? error.message : String(error ?? "");
     return (
         <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-[var(--border)] bg-[var(--bg-2)]/70 p-6 text-center text-sm">
-            <p className="font-semibold text-[var(--red)]">This panel crashed</p>
+            <p className="font-semibold text-[var(--red)]">
+                This panel crashed
+            </p>
             <p className="max-w-md font-mono text-xs break-words text-[var(--text-dim)]">
                 {message}
             </p>
+        </div>
+    );
+}
+
+/**
+ * Slim bar above the diff: signal hierarchy on the left (what needs attention
+ * vs. what's minor) and review progress on the right (files viewed / total).
+ * Gives the reviewer an overview and a sense of "where am I" before the diff —
+ * the two things GitHub's raw file list never answers.
+ */
+function ReviewProgressBar({
+    viewed,
+    total,
+    attention,
+    minor,
+}: {
+    viewed: number;
+    total: number;
+    attention: number;
+    minor: number;
+}) {
+    const pct = total > 0 ? Math.round((100 * viewed) / total) : 0;
+    return (
+        <div className="mt-3 mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--bg-2)]/70 px-4 py-2.5">
+            <div className="flex items-center gap-2.5 text-sm">
+                {attention > 0 ? (
+                    <span className="inline-flex items-center gap-1.5 font-medium text-[var(--warn)]">
+                        <span className="size-1.5 rounded-full bg-[var(--warn)]" />
+                        {attention} need attention
+                    </span>
+                ) : (
+                    <span className="inline-flex items-center gap-1.5 font-medium text-[var(--green)]">
+                        <span className="size-1.5 rounded-full bg-[var(--green)]" />
+                        nothing critical
+                    </span>
+                )}
+                {minor > 0 && (
+                    <span className="text-[var(--text-dim)]">
+                        · {minor} minor
+                    </span>
+                )}
+            </div>
+            <div className="flex items-center gap-2.5">
+                <span className="font-mono text-xs text-[var(--text-muted)] tabular-nums">
+                    {viewed} / {total} viewed
+                </span>
+                <span
+                    className="h-1.5 w-24 overflow-hidden rounded-full bg-[var(--bg-4)]"
+                    role="progressbar"
+                    aria-valuenow={pct}
+                    aria-valuemin={0}
+                    aria-valuemax={100}>
+                    <span
+                        className="block h-full rounded-full bg-[var(--accent)] transition-[width] duration-300"
+                        style={{ width: `${pct}%` }}
+                    />
+                </span>
+            </div>
         </div>
     );
 }
@@ -92,27 +153,35 @@ export function ReviewPageClient({
         error: filesError,
     } = usePullRequestFiles(repositoryId, prNumber, teamId, repoName);
 
-    const fileSuggestions = suggestionsData?.data?.suggestions?.files ?? [];
-    const prLevelSuggestions =
-        suggestionsData?.data?.suggestions?.prLevel ?? [];
-    const patchFiles: PullRequestFile[] = filesData?.data?.files ?? [];
-    const commits: PullRequestCommit[] = filesData?.data?.commits ?? [];
+    // Derive these through useMemo so their reference is stable across renders
+    // while the underlying query data is unchanged. Without it, `?? []` (and
+    // the optional-chain miss during loading) hands a fresh array to every
+    // downstream memo — adaptForTryDiffViewer, buildTree, buildCohorts — on
+    // each render, defeating their memoization on a screen whose diffs are the
+    // expensive part to recompute.
+    const fileSuggestions = useMemo(
+        () => suggestionsData?.data?.suggestions?.files ?? [],
+        [suggestionsData],
+    );
+    const prLevelSuggestions = useMemo(
+        () => suggestionsData?.data?.suggestions?.prLevel ?? [],
+        [suggestionsData],
+    );
+    const patchFiles: PullRequestFile[] = useMemo(
+        () => filesData?.data?.files ?? [],
+        [filesData],
+    );
+    const commits: PullRequestCommit[] = useMemo(
+        () => filesData?.data?.commits ?? [],
+        [filesData],
+    );
     const patchFilenames = useMemo(
         () => patchFiles.map((f) => f.filename),
         [patchFiles],
     );
 
     if (suggestionsLoading) {
-        return (
-            <div className="flex h-full items-center justify-center">
-                <div className="flex flex-col items-center gap-3">
-                    <Spinner className="size-6" />
-                    <p className="text-text-tertiary text-sm">
-                        Loading suggestions...
-                    </p>
-                </div>
-            </div>
-        );
+        return <ReviewPageSkeleton />;
     }
 
     if (suggestionsError) {
@@ -153,6 +222,36 @@ export function ReviewPageClient({
     );
 }
 
+// Mirrors ReviewLayout's shell (max-w-[1600px] + file-tree / diff / sidebar
+// grid) so the page paints its structure immediately instead of a centered
+// spinner while suggestions load.
+function ReviewPageSkeleton() {
+    return (
+        <div className="kodus-scroll h-full overflow-y-auto bg-[var(--bg)]">
+            <section className="px-6 py-6">
+                <div className="mx-auto max-w-[1600px]">
+                    <Skeleton className="mb-4 h-4 w-28" />
+                    <div className="grid grid-cols-1 gap-5 lg:grid-cols-[280px_minmax(0,1fr)_300px]">
+                        <div className="hidden flex-col gap-2 lg:flex">
+                            {Array.from({ length: 9 }).map((_, i) => (
+                                <Skeleton key={i} className="h-6 w-full" />
+                            ))}
+                        </div>
+                        <div className="flex min-w-0 flex-col gap-4">
+                            <Skeleton className="h-16 w-full rounded-xl" />
+                            <Skeleton className="h-[60vh] w-full rounded-xl" />
+                        </div>
+                        <div className="hidden flex-col gap-3 lg:flex">
+                            <Skeleton className="h-32 w-full rounded-xl" />
+                            <Skeleton className="h-48 w-full rounded-xl" />
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </div>
+    );
+}
+
 function ReviewLayout({
     execution,
     fileSuggestions,
@@ -178,6 +277,24 @@ function ReviewLayout({
 }) {
     const { state, dispatch, navigateFile } = useReviewStore();
     const [activeTab, setActiveTab] = useState<PrTab>("review");
+    // Folder tree vs. role-grouped cohorts. Persisted so the choice sticks
+    // across PRs. Applied AFTER mount (not in the initializer) so the server
+    // and the first client render agree on the "tree" default — reading
+    // localStorage in the initializer would diverge and trip a hydration
+    // mismatch. This one-time sync of a client-only preference is the case the
+    // set-state-in-effect heuristic doesn't cover, hence the scoped disable.
+    const [treeMode, setTreeMode] = useState<FileTreeMode>("tree");
+    useEffect(() => {
+        const saved = window.localStorage.getItem(FILE_TREE_MODE_KEY);
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        if (saved === "grouped" || saved === "tree") setTreeMode(saved);
+    }, []);
+    const toggleTreeMode = () =>
+        setTreeMode((m) => {
+            const next = m === "tree" ? "grouped" : "tree";
+            window.localStorage.setItem(FILE_TREE_MODE_KEY, next);
+            return next;
+        });
 
     // Deep link: /pull-requests/<repo>/<num>?file=<path>&suggestion=<id>
     // Lands the user on the exact finding — scrolls to it and lights it up.
@@ -211,8 +328,66 @@ function ReviewLayout({
 
     const suggestionCount = fileSuggestions.length + prLevelSuggestions.length;
 
+    // Orientation + signal hierarchy for the review header: how far the
+    // reviewer has gotten, and how many findings actually need attention vs.
+    // are minor. Bucketed case-insensitively so it survives severity casing.
+    const viewedCount = useMemo(
+        () => treeFiles.filter((f) => state.viewedFiles[f.path]).length,
+        [treeFiles, state.viewedFiles],
+    );
+    // Count critical/high across BOTH file-level and PR-level findings so the
+    // "needs attention" figure — and the derived "minor" count below — line up
+    // with suggestionCount, which also includes prLevelSuggestions. Counting
+    // only treeIssues here let PR-level criticals leak into the "minor" tally.
+    const attentionCount = useMemo(() => {
+        const isAttention = (severity?: string) =>
+            ["critical", "high"].includes((severity ?? "").toLowerCase());
+        const fromFiles = treeIssues.filter((i) =>
+            isAttention(i.severity),
+        ).length;
+        const fromPrLevel = prLevelSuggestions.filter((s) =>
+            isAttention(s?.severity),
+        ).length;
+        return fromFiles + fromPrLevel;
+    }, [treeIssues, prLevelSuggestions]);
+
     const jumpToFile = (path: string) =>
         dispatch({ type: "SELECT_FILE", path });
+
+    // Click on a sidebar finding → land ON that suggestion (not the file top)
+    // and pulse it. Targets the `suggestion-<id>` anchor, which is keyed on the
+    // finding's own id, so it works even when the finding's file path doesn't
+    // match the diff's — the reason clicking used to do nothing. Retries a few
+    // frames while the diff finishes mounting.
+    const [activeIssueId, setActiveIssueId] = useState<string | null>(null);
+    const jumpToIssue = (issue: ReviewIssue) => {
+        if (issue.file) dispatch({ type: "SELECT_FILE", path: issue.file });
+        const targetId = issue.id
+            ? `suggestion-${issue.id}`
+            : issue.file
+              ? `file-${issue.file}`
+              : null;
+        if (issue.id) setActiveIssueId(issue.id);
+        if (!targetId) return;
+        let tries = 0;
+        const tryScroll = () => {
+            const el = document.getElementById(targetId);
+            if (el) {
+                el.scrollIntoView({ behavior: "smooth", block: "center" });
+                return;
+            }
+            if (tries++ < 60) requestAnimationFrame(tryScroll);
+        };
+        requestAnimationFrame(tryScroll);
+    };
+
+    // Keep the highlight in sync with the URL: navigating to (or away from) a
+    // deep-linked finding overrides a stale activeIssueId left by a prior
+    // sidebar click, so back/forward doesn't light up the wrong card.
+    useEffect(() => {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        setActiveIssueId(deepLinkIssue ?? null);
+    }, [deepLinkIssue]);
 
     // Keyboard shortcuts
     useEffect(() => {
@@ -320,6 +495,8 @@ function ReviewLayout({
                                     viewed={state.viewedFiles}
                                     onPick={jumpToFile}
                                     prRef={`PR #${prNumber}`}
+                                    mode={treeMode}
+                                    onToggleMode={toggleTreeMode}
                                     onHide={() =>
                                         dispatch({ type: "TOGGLE_SIDEBAR" })
                                     }
@@ -345,6 +522,18 @@ function ReviewLayout({
                             />
 
                             {activeTab === "review" && (
+                                <ReviewProgressBar
+                                    viewed={viewedCount}
+                                    total={treeFiles.length}
+                                    attention={attentionCount}
+                                    minor={Math.max(
+                                        0,
+                                        suggestionCount - attentionCount,
+                                    )}
+                                />
+                            )}
+
+                            {activeTab === "review" && (
                                 <ErrorBoundary FallbackComponent={PanelError}>
                                     <DiffViewer
                                         patchFiles={patchFiles}
@@ -354,7 +543,9 @@ function ReviewLayout({
                                         prUrl={prUrl}
                                         repositoryName={repositoryName}
                                         highlightIssueId={
-                                            deepLinkIssue ?? undefined
+                                            activeIssueId ??
+                                            deepLinkIssue ??
+                                            undefined
                                         }
                                     />
                                 </ErrorBoundary>
@@ -372,7 +563,7 @@ function ReviewLayout({
                                     pr={pr}
                                     issues={treeIssues}
                                     isCompleted
-                                    onJumpToIssue={jumpToFile}
+                                    onJumpToIssue={jumpToIssue}
                                 />
                             </ErrorBoundary>
                         </aside>

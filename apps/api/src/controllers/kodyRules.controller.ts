@@ -4,6 +4,7 @@ import { ApplyPendingKodyRulesUseCase } from '@libs/kodyRules/application/use-ca
 import { GetPendingKodyRulesUseCase } from '@libs/kodyRules/application/use-cases/get-pending-kody-rules.use-case';
 import { ChangeStatusKodyRulesUseCase } from '@libs/kodyRules/application/use-cases/change-status-kody-rules.use-case';
 import { CheckSyncStatusUseCase } from '@libs/kodyRules/application/use-cases/check-sync-status.use-case';
+import { ListPastReviewersUseCase } from '@libs/kodyRules/application/use-cases/list-past-reviewers.use-case';
 import { ConvertPendingUpdatesToNewUseCase } from '@libs/kodyRules/application/use-cases/convert-pending-updates-to-new.use-case';
 import { CreateOrUpdateKodyRulesUseCase } from '@libs/kodyRules/application/use-cases/create-or-update.use-case';
 import { DeleteRuleInOrganizationByIdKodyRulesUseCase } from '@libs/kodyRules/application/use-cases/delete-rule-in-organization-by-id.use-case';
@@ -23,6 +24,11 @@ import { ImportFastKodyRulesUseCase } from '@libs/kodyRules/application/use-case
 import { ManageImportedKodyRulesUseCase } from '@libs/kodyRules/application/use-cases/manage-imported-kody-rules.use-case';
 import { ResyncRulesFromIdeUseCase } from '@libs/kodyRules/application/use-cases/resync-rules-from-ide.use-case';
 import { SyncSelectedRepositoriesKodyRulesUseCase } from '@libs/kodyRules/application/use-cases/sync-selected-repositories.use-case';
+import { GetGlobalRulesSourceRepositoriesUseCase } from '@libs/kodyRules/application/use-cases/get-global-rules-source-repositories.use-case';
+import { UpdateGlobalRulesSourceRepositoriesUseCase } from '@libs/kodyRules/application/use-cases/update-global-rules-source-repositories.use-case';
+import { ResyncGlobalRulesUseCase } from '@libs/kodyRules/application/use-cases/resync-global-rules.use-case';
+import { GetGlobalRulesImportStatusUseCase } from '@libs/kodyRules/application/use-cases/get-global-rules-import-status.use-case';
+import { GlobalRulesSourceRepository } from '@libs/kodyRules/domain/interfaces/global-rules-source.interface';
 import { ImportFastKodyRulesDto } from '@libs/kodyRules/dtos/import-fast-kody-rules.dto';
 import { ReviewFastKodyRulesDto } from '../dtos/review-fast-kody-rules.dto';
 
@@ -60,6 +66,7 @@ import {
     Query,
     UseGuards,
 } from '@nestjs/common';
+import { KodyRulesTenantGuard } from '../guards/kody-rules-tenant.guard';
 import { REQUEST } from '@nestjs/core';
 import {
     ApiBearerAuth,
@@ -112,8 +119,13 @@ export class KodyRulesController {
         private readonly getPendingKodyRulesUseCase: GetPendingKodyRulesUseCase,
         private readonly changeStatusKodyRulesUseCase: ChangeStatusKodyRulesUseCase,
         private readonly checkSyncStatusUseCase: CheckSyncStatusUseCase,
+        private readonly listPastReviewersUseCase: ListPastReviewersUseCase,
         private readonly cacheService: CacheService,
         private readonly syncSelectedReposKodyRulesUseCase: SyncSelectedRepositoriesKodyRulesUseCase,
+        private readonly getGlobalRulesSourceRepositoriesUseCase: GetGlobalRulesSourceRepositoriesUseCase,
+        private readonly updateGlobalRulesSourceRepositoriesUseCase: UpdateGlobalRulesSourceRepositoriesUseCase,
+        private readonly resyncGlobalRulesUseCase: ResyncGlobalRulesUseCase,
+        private readonly getGlobalRulesImportStatusUseCase: GetGlobalRulesImportStatusUseCase,
         private readonly getInheritedRulesKodyRulesUseCase: GetInheritedRulesKodyRulesUseCase,
         private readonly getRulesLimitStatusUseCase: GetRulesLimitStatusUseCase,
         private readonly findSuggestionsByRuleUseCase: FindSuggestionsByRuleUseCase,
@@ -418,7 +430,7 @@ export class KodyRulesController {
 
     @ApiBearerAuth('jwt')
     @Post('/generate-kody-rules')
-    @UseGuards(PolicyGuard)
+    @UseGuards(PolicyGuard, KodyRulesTenantGuard)
     @CheckPolicies(
         checkPermissions({
             action: Action.Create,
@@ -519,7 +531,7 @@ export class KodyRulesController {
 
     @ApiBearerAuth('jwt')
     @Get('/check-sync-status')
-    @UseGuards(PolicyGuard)
+    @UseGuards(PolicyGuard, KodyRulesTenantGuard)
     @CheckPolicies(
         checkPermissions({
             action: Action.Read,
@@ -560,8 +572,38 @@ export class KodyRulesController {
     }
 
     @ApiBearerAuth('jwt')
+    @Get('/past-reviewers')
+    @UseGuards(PolicyGuard, KodyRulesTenantGuard)
+    @CheckPolicies(
+        checkPermissions({
+            action: Action.Read,
+            resource: ResourceType.KodyRules,
+        }),
+    )
+    @ApiOperation({
+        summary: 'List past reviewers',
+        description:
+            'Candidate git reviewers (current members ∪ PR authors in the window) a client can exclude from Kody Rules learning.',
+    })
+    @ApiQuery({ name: 'teamId', type: String, required: true })
+    @ApiQuery({ name: 'repositoryId', type: String, required: false })
+    @ApiQuery({ name: 'months', type: Number, required: false })
+    public async listPastReviewers(
+        @Query('teamId') teamId: string,
+        @Query('repositoryId') repositoryId?: string,
+        @Query('months') months?: string,
+    ) {
+        // Just parse the query string here; the use-case validates/bounds it.
+        return this.listPastReviewersUseCase.execute({
+            teamId,
+            repositoryId,
+            months: months !== undefined ? Number(months) : undefined,
+        });
+    }
+
+    @ApiBearerAuth('jwt')
     @Post('/sync-ide-rules')
-    @UseGuards(PolicyGuard)
+    @UseGuards(PolicyGuard, KodyRulesTenantGuard)
     @CheckPolicies(
         checkPermissions({
             action: Action.Create,
@@ -586,7 +628,7 @@ export class KodyRulesController {
 
     @ApiBearerAuth('jwt')
     @Post('/fast-sync-ide-rules')
-    @UseGuards(PolicyGuard)
+    @UseGuards(PolicyGuard, KodyRulesTenantGuard)
     @CheckPolicies(
         checkPermissions({
             action: Action.Create,
@@ -612,6 +654,93 @@ export class KodyRulesController {
     }
 
     @ApiBearerAuth('jwt')
+    @Get('/global-source-repositories')
+    @UseGuards(PolicyGuard, KodyRulesTenantGuard)
+    @CheckPolicies(
+        checkPermissions({
+            action: Action.Read,
+            resource: ResourceType.KodyRules,
+        }),
+    )
+    @ApiOperation({
+        summary: 'List global-rules source repositories',
+        description:
+            'Return the repositories currently selected as sources of global Kody Rules.',
+    })
+    @ApiQuery({ name: 'teamId', type: String, required: true })
+    public async getGlobalSourceRepositories(
+        @Query('teamId') teamId: string,
+    ) {
+        return this.getGlobalRulesSourceRepositoriesUseCase.execute({ teamId });
+    }
+
+    @ApiBearerAuth('jwt')
+    @Get('/global-source-repositories/import-status')
+    @UseGuards(PolicyGuard, KodyRulesTenantGuard)
+    @CheckPolicies(
+        checkPermissions({
+            action: Action.Read,
+            resource: ResourceType.KodyRules,
+        }),
+    )
+    @ApiOperation({
+        summary: 'Global-rules import quota status',
+        description:
+            'Return the plan tier (free/trial/paid), the import limit, and how many global rules are already imported, so the UI can gate the control.',
+    })
+    @ApiQuery({ name: 'teamId', type: String, required: true })
+    public async getGlobalRulesImportStatus(
+        @Query('teamId') teamId: string,
+    ) {
+        return this.getGlobalRulesImportStatusUseCase.execute({ teamId });
+    }
+
+    @ApiBearerAuth('jwt')
+    @Post('/global-source-repositories')
+    @UseGuards(PolicyGuard, KodyRulesTenantGuard)
+    @CheckPolicies(
+        checkPermissions({
+            action: Action.Create,
+            resource: ResourceType.KodyRules,
+        }),
+    )
+    @ApiOperation({
+        summary: 'Set global-rules source repositories',
+        description:
+            'Persist the selected source repositories for global Kody Rules; imports added repos and removes rules from deselected ones.',
+    })
+    public async setGlobalSourceRepositories(
+        @Body()
+        body: {
+            teamId: string;
+            repositories: GlobalRulesSourceRepository[];
+        },
+    ) {
+        return this.updateGlobalRulesSourceRepositoriesUseCase.execute({
+            teamId: body.teamId,
+            repositories: body.repositories ?? [],
+        });
+    }
+
+    @ApiBearerAuth('jwt')
+    @Post('/resync-global-rules')
+    @UseGuards(PolicyGuard, KodyRulesTenantGuard)
+    @CheckPolicies(
+        checkPermissions({
+            action: Action.Create,
+            resource: ResourceType.KodyRules,
+        }),
+    )
+    @ApiOperation({
+        summary: 'Resync global rules',
+        description:
+            'Re-scan every configured source repository into the global scope (covers direct-push changes).',
+    })
+    public async resyncGlobalRules(@Body() body: { teamId: string }) {
+        return this.resyncGlobalRulesUseCase.execute({ teamId: body.teamId });
+    }
+
+    @ApiBearerAuth('jwt')
     @Get('/pending')
     @UseGuards(PolicyGuard)
     @CheckPolicies(
@@ -633,7 +762,7 @@ export class KodyRulesController {
 
     @ApiBearerAuth('jwt')
     @Get('/pending-ide-rules')
-    @UseGuards(PolicyGuard)
+    @UseGuards(PolicyGuard, KodyRulesTenantGuard)
     @CheckPolicies(
         checkPermissions({
             action: Action.Read,
@@ -716,7 +845,7 @@ export class KodyRulesController {
 
     @ApiBearerAuth('jwt')
     @Get('/inherited-rules')
-    @UseGuards(PolicyGuard)
+    @UseGuards(PolicyGuard, KodyRulesTenantGuard)
     @CheckPolicies(
         checkRepoPermissions({
             action: Action.Read,
@@ -763,7 +892,7 @@ export class KodyRulesController {
     // NOT USED IN WEB - INTERNAL USE ONLY
     @ApiBearerAuth('jwt')
     @Post('/resync-ide-rules')
-    @UseGuards(PolicyGuard)
+    @UseGuards(PolicyGuard, KodyRulesTenantGuard)
     @CheckPolicies(
         checkPermissions({
             action: Action.Create,

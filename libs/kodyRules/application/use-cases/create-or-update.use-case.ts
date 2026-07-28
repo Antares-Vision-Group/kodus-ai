@@ -1,4 +1,4 @@
-import { createLogger } from '@kodus/flow';
+import { createLogger } from '@libs/core/log/logger';
 import {
     CentralizedConfigPrService,
     CentralizedPrMetadata,
@@ -24,6 +24,11 @@ import {
     ResourceType,
 } from '@libs/identity/domain/permissions/enums/permissions.enum';
 import { AuthorizationService } from '@libs/identity/infrastructure/adapters/services/permissions/authorization.service';
+import { PermissionValidationService } from '@libs/ee/shared/services/permissionValidation.service';
+import {
+    IKodyRuleDetectorCompiler,
+    KODY_RULE_DETECTOR_COMPILER_TOKEN,
+} from '../../domain/contracts/kody-rule-detector-compiler.contract';
 import {
     IKodyRulesService,
     KODY_RULES_SERVICE_TOKEN,
@@ -47,6 +52,9 @@ export class CreateOrUpdateKodyRulesUseCase {
         private readonly authorizationService: AuthorizationService,
         private readonly contextReferenceDetectionService: ContextReferenceDetectionService,
         private readonly centralizedConfigPrService: CentralizedConfigPrService,
+        private readonly permissionValidationService: PermissionValidationService,
+        @Inject(KODY_RULE_DETECTOR_COMPILER_TOKEN)
+        private readonly detectorCompiler: IKodyRuleDetectorCompiler,
     ) {}
 
     async execute(
@@ -75,8 +83,19 @@ export class CreateOrUpdateKodyRulesUseCase {
                     ? { userId: reqUser.uuid, userEmail: reqUser.email }
                     : { userId: 'kody-system', userEmail: 'kody@kodus.io' });
 
+            // Centralized config is the source of truth for APPROVED rules
+            // only. A rule persisted as PENDING (awaiting approval) or REJECTED
+            // must not be routed into the rolling PR — it stays in the DB until
+            // approved, at which point the apply/convert use-cases re-run this
+            // flow with an active status and it exports normally.
+            const isApprovedForCentralized =
+                !kodyRule.status ||
+                kodyRule.status === KodyRulesStatus.ACTIVE ||
+                kodyRule.status === KodyRulesStatus.PAUSED;
+
             const bypassCentralizedRouting =
-                this.isInternalSyncActor(userInfoData);
+                this.isInternalSyncActor(userInfoData) ||
+                !isApprovedForCentralized;
 
             if (
                 !skipAuthorization &&
@@ -161,6 +180,28 @@ export class CreateOrUpdateKodyRulesUseCase {
                         },
                     });
                 });
+
+                // T0 (#1449): compile a deterministic detector for mechanical
+                // rules so review checks them in pure code. Fire-and-forget,
+                // gated — a rule only gets a detector if it passes the compile
+                // gate; otherwise it stays semantic. Never blocks the save.
+                this.detectorCompiler
+                    .compileAndSave(organizationAndTeamData, result.uuid, {
+                        ...kodyRule,
+                        uuid: result.uuid,
+                        // Carry the persisted detector (the DTO has none) so
+                        // compileAndSave can clear a stale one when an edited
+                        // rule stops being mechanical.
+                        detector: (result as IKodyRule).detector,
+                    })
+                    .catch((error) => {
+                        this.logger.error({
+                            message: 'Background detector compile failed',
+                            context: CreateOrUpdateKodyRulesUseCase.name,
+                            error: this.normalizeError(error),
+                            metadata: { ruleId: result.uuid },
+                        });
+                    });
             } else {
                 this.logger.warn({
                     message:
@@ -660,6 +701,15 @@ export class CreateOrUpdateKodyRulesUseCase {
                         },
                     ];
 
+                    const [byokConfig, subscriptionStatus] = await Promise.all([
+                        this.permissionValidationService.getBYOKConfig(
+                            detectionOrgData,
+                        ),
+                        this.permissionValidationService.getSubscriptionStatus(
+                            detectionOrgData,
+                        ),
+                    ]);
+
                     const contextReferenceId =
                         await this.contextReferenceDetectionService.detectAndSaveReferences(
                             {
@@ -669,6 +719,8 @@ export class CreateOrUpdateKodyRulesUseCase {
                                 repositoryId,
                                 repositoryName,
                                 organizationAndTeamData: detectionOrgData,
+                                byokConfig: byokConfig ?? undefined,
+                                subscriptionStatus,
                             },
                         );
 

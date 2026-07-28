@@ -13,7 +13,7 @@ import {
     IOrganizationParametersService,
     ORGANIZATION_PARAMETERS_SERVICE_TOKEN,
 } from '@libs/organization/domain/organizationParameters/contracts/organizationParameters.service.contract';
-import { createLogger } from '@kodus/flow';
+import { createLogger } from '@libs/core/log/logger';
 
 export enum PlanType {
     FREE = 'free',
@@ -742,5 +742,97 @@ export class PermissionValidationService {
         );
 
         return byokConfig?.configValue || null;
+    }
+
+    /**
+     * Returns the org's current subscription status (e.g. 'trial', 'active').
+     * Used by non-review flows (kody-rules, config detection) to mirror the
+     * code review pipeline's trial-only defaults for helper LLM calls.
+     * Non-UUID org ids (CLI trial requests) and errors resolve to undefined.
+     */
+    async getSubscriptionStatus(
+        organizationAndTeamData: OrganizationAndTeamData,
+    ): Promise<string | undefined> {
+        const UUID_RE =
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (!UUID_RE.test(organizationAndTeamData?.organizationId || '')) {
+            return undefined;
+        }
+
+        try {
+            const validation =
+                await this.licenseService.validateOrganizationLicense(
+                    organizationAndTeamData,
+                );
+            return validation?.subscriptionStatus;
+        } catch {
+            return undefined;
+        }
+    }
+
+    /**
+     * Access tier for the global Kody Rules import feature:
+     *   - `free`  → blocked (no valid license, or an explicit Free plan);
+     *   - `trial` → capped (see GLOBAL_RULES_TRIAL_IMPORT_LIMIT);
+     *   - `paid`  → unlimited (any other valid plan).
+     *
+     * The sync engine and the web UI both resolve access through this single
+     * method so enforcement and the on-screen state can never disagree. Cloud
+     * and self-hosted are treated identically: a valid, non-trial, non-free
+     * license (including a `licensed-self-hosted` key) is `paid`, and an
+     * unlicensed install (self-hosted CE / an expired or missing key) is `free`
+     * — matching how `shouldLimitResources` already treats unlicensed installs.
+     * Fails closed to `free` on a license lookup error.
+     */
+    async resolveGlobalRulesImportTier(
+        organizationAndTeamData: OrganizationAndTeamData,
+        contextName?: string,
+    ): Promise<'free' | 'trial' | 'paid'> {
+        // Dev-only override so the free/trial/paid UI can be exercised locally
+        // (where an install usually has no license and would resolve to free).
+        // Never honored outside development mode.
+        if (this.isDevelopment) {
+            const override = process.env.GLOBAL_RULES_IMPORT_TIER_OVERRIDE;
+            if (
+                override === 'free' ||
+                override === 'trial' ||
+                override === 'paid'
+            ) {
+                return override;
+            }
+        }
+
+        try {
+            const validation =
+                await this.licenseService.validateOrganizationLicense(
+                    organizationAndTeamData,
+                );
+
+            // No valid license (cloud Free, or self-hosted without an
+            // activation key / expired) → feature blocked.
+            if (!validation?.valid) {
+                return 'free';
+            }
+
+            if (validation.subscriptionStatus === 'trial') {
+                return 'trial';
+            }
+
+            if (this.identifyPlanType(validation.planType) === PlanType.FREE) {
+                return 'free';
+            }
+
+            // Any other valid plan, including a licensed self-hosted key.
+            return 'paid';
+        } catch (error) {
+            this.logger.error({
+                message:
+                    'Failed to resolve global rules import tier; defaulting to free',
+                context: contextName || PermissionValidationService.name,
+                error,
+                metadata: { organizationAndTeamData },
+            });
+            return 'free';
+        }
     }
 }

@@ -14,6 +14,7 @@ import { Reaction } from '@libs/code-review/domain/codeReviewFeedback/enums/code
 import { decrypt, encrypt } from '@libs/common/utils/crypto';
 import { fitPRDescription } from '@libs/code-review/utils/fit-pr-description';
 import { IntegrationServiceDecorator } from '@libs/common/utils/decorators/integration-service.decorator';
+import { resolveGitlabDraftStatus } from '@libs/common/utils/webhooks/gitlab-draft.utils';
 import { CacheService } from '@libs/core/cache/cache.service';
 import {
     CreateAuthIntegrationStatus,
@@ -47,7 +48,7 @@ import {
 import { MCPManagerService } from '@libs/mcp-server/services/mcp-manager.service';
 import { ICodeManagementService } from '@libs/platform/domain/platformIntegrations/interfaces/code-management.interface';
 
-import { createLogger } from '@kodus/flow';
+import { createLogger } from '@libs/core/log/logger';
 import { hasKodyMarker } from '@libs/common/utils/codeManagement/codeCommentMarkers';
 import { getCodeReviewBadge } from '@libs/common/utils/codeManagement/codeReviewBadge';
 import { getLabelShield } from '@libs/common/utils/codeManagement/labels';
@@ -870,9 +871,16 @@ export class GitlabService implements Omit<
                 params.type,
             );
 
-            this.createMergeRequestWebhook({
+            // Deliberately not awaited (webhook creation must not block the
+            // integration-config save) — but the promise MUST be caught:
+            // createMergeRequestWebhook rethrows on failure, and an orphaned
+            // rejection escalates to an unhandledRejection that can crash the
+            // API process (observed on the Bitbucket twin of this call). The
+            // failure still gets a loud error log from the method's own
+            // catch; this catch only stops the crash.
+            void this.createMergeRequestWebhook({
                 organizationAndTeamData: params.organizationAndTeamData,
-            });
+            }).catch(() => undefined);
         } catch (err) {
             throw new BadRequestException(err);
         }
@@ -2814,7 +2822,7 @@ export class GitlabService implements Omit<
                 const existingHooks = await gitlabAPI.ProjectHooks.all(repo.id);
 
                 const hookExists = existingHooks.some(
-                    (hook) => hook.url === webhookUrl,
+                    (hook) => hook?.url === webhookUrl,
                 );
 
                 if (!hookExists) {
@@ -3338,7 +3346,13 @@ export class GitlabService implements Omit<
                 params.organizationAndTeamData,
             );
 
-            if (!gitlabAuthDetail) {
+            // getAuthDetails spreads the lookup and defaults authMode, so it is
+            // always truthy — a plain `!gitlabAuthDetail` check never fires for
+            // an organization with no GitLab integration. Assert on the auth
+            // material instead: without it we would fall back to the
+            // gitlab.com base URL and hand back a tokenless clone URL for a
+            // host the caller never asked for (same failure as #1541).
+            if (!gitlabAuthDetail?.accessToken) {
                 throw new Error('GitLab authentication details not found');
             }
 
@@ -4241,7 +4255,7 @@ export class GitlabService implements Omit<
                         );
 
                         const webhookToDelete = webhooks.find(
-                            (webhook) => webhook.url === webhookUrl,
+                            (webhook) => webhook?.url === webhookUrl,
                         );
 
                         if (webhookToDelete) {
@@ -4828,7 +4842,7 @@ export class GitlabService implements Omit<
                 name: mergeRequest?.author?.name ?? '',
                 id: mergeRequest?.author?.id?.toString() ?? '',
             },
-            isDraft: mergeRequest?.draft ?? false,
+            isDraft: resolveGitlabDraftStatus(mergeRequest),
         };
     }
 

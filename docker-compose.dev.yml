@@ -28,11 +28,16 @@ x-app-service-template: &app-service-defaults
     environment:
         - CHOKIDAR_USEPOLLING=false
         - API_DEVELOPMENT_MODE=${API_DEVELOPMENT_MODE:-true}
+        # pnpm 11 wants a TTY to confirm purging node_modules when manifests
+        # change (e.g. after a branch switch). The dev-entrypoint runs
+        # non-interactively, so CI=true lets pnpm skip the confirmation and
+        # sync deps instead of aborting with ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY.
+        - CI=true
     restart: unless-stopped
     volumes:
         - .:/usr/src/app:delegated
         - node_modules_cache:/usr/src/app/node_modules
-        - pnpm_store:/pnpm-store
+        - pnpm_store:/usr/src/app/.pnpm-store
         - logs_data:/usr/src/app/logs
         - yalc_store:/root/.yalc
     networks:
@@ -89,6 +94,10 @@ services:
             retries: 8
             start_period: 180s
         environment:
+            # pnpm 11 aborts a non-interactive node_modules purge (branch
+            # switch → manifest drift) without CI=true. Per-service blocks
+            # override the anchor's environment list, so it must be set here.
+            - CI=true
             - API_CLOUD_MODE=${API_CLOUD_MODE:-false}
             - NODE_OPTIONS=--max-old-space-size=2560 --max-semi-space-size=64
             - DEBUG_PORT=9229
@@ -114,7 +123,7 @@ services:
         volumes:
             - .:/usr/src/app:delegated
             - node_modules_cache:/usr/src/app/node_modules:nocopy
-            - pnpm_store:/pnpm-store
+            - pnpm_store:/usr/src/app/.pnpm-store
             - logs_data:/usr/src/app/logs
             - yalc_store:/root/.yalc
         ports:
@@ -142,6 +151,10 @@ services:
             retries: 3
             start_period: 60s
         environment:
+            # pnpm 11 aborts a non-interactive node_modules purge (branch
+            # switch → manifest drift) without CI=true. Per-service blocks
+            # override the anchor's environment list, so it must be set here.
+            - CI=true
             - API_CLOUD_MODE=${API_CLOUD_MODE:-false}
             # V8 heap kept below the 2G container cap (with ~500M headroom
             # for native modules, thread stacks, and Node runtime overhead).
@@ -178,7 +191,7 @@ services:
         volumes:
             - .:/usr/src/app:delegated
             - node_modules_cache:/usr/src/app/node_modules:nocopy
-            - pnpm_store:/pnpm-store
+            - pnpm_store:/usr/src/app/.pnpm-store
             - logs_data:/usr/src/app/logs
             - yalc_store:/root/.yalc
         ports:
@@ -212,6 +225,10 @@ services:
             retries: 3
             start_period: 60s
         environment:
+            # pnpm 11 aborts a non-interactive node_modules purge (branch
+            # switch → manifest drift) without CI=true. Per-service blocks
+            # override the anchor's environment list, so it must be set here.
+            - CI=true
             - API_CLOUD_MODE=${API_CLOUD_MODE:-false}
             # V8 heap kept below the 1G container cap. 1536M heap on a
             # 1G cgroup let V8 grow past the limit and triggered silent
@@ -241,7 +258,7 @@ services:
         volumes:
             - .:/usr/src/app:delegated
             - node_modules_cache:/usr/src/app/node_modules:nocopy
-            - pnpm_store:/pnpm-store
+            - pnpm_store:/usr/src/app/.pnpm-store
             - logs_data:/usr/src/app/logs
             - yalc_store:/root/.yalc
         ports:
@@ -266,6 +283,10 @@ services:
             retries: 3
             start_period: 60s
         environment:
+            # pnpm 11 aborts a non-interactive node_modules purge (branch
+            # switch → manifest drift) without CI=true. Per-service blocks
+            # override the anchor's environment list, so it must be set here.
+            - CI=true
             - API_CLOUD_MODE=${API_CLOUD_MODE:-false}
             # V8 heap kept below the 1G container cap. 4096M heap on a
             # 1G cgroup let V8 grow past the limit and triggered silent
@@ -333,10 +354,8 @@ services:
             - API_MCP_MANAGER_JWT_SECRET=${API_MCP_MANAGER_JWT_SECRET:-}
             - API_MCP_MANAGER_ENCRYPTION_SECRET=${API_MCP_MANAGER_ENCRYPTION_SECRET:-}
             - API_MCP_MANAGER_PG_DB_SCHEMA=${API_MCP_MANAGER_PG_DB_SCHEMA:-mcp-manager}
-            - API_MCP_MANAGER_MCP_PROVIDERS=${API_MCP_MANAGER_MCP_PROVIDERS:-kodusmcp,composio,custom}
+            - API_MCP_MANAGER_MCP_PROVIDERS=${API_MCP_MANAGER_MCP_PROVIDERS:-kodusmcp,custom}
             - API_MCP_MANAGER_REDIRECT_URI=${API_MCP_MANAGER_REDIRECT_URI:-http://localhost:3000/setup/mcp/oauth}
-            - API_MCP_MANAGER_COMPOSIO_BASE_URL=${API_MCP_MANAGER_COMPOSIO_BASE_URL:-https://backend.composio.dev/api/v3}
-            - API_MCP_MANAGER_COMPOSIO_API_KEY=${API_MCP_MANAGER_COMPOSIO_API_KEY:-}
 
     #----------------------------------------------------------------
     # Web Frontend
@@ -392,7 +411,7 @@ services:
         deploy:
             resources:
                 limits:
-                    memory: 2G
+                    memory: 4G
                 reservations:
                     memory: 512M
         logging: *default-logging

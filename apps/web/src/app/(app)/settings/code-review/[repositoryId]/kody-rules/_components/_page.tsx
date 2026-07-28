@@ -1,25 +1,22 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { KodyRulesLimitPopover } from "@components/system/kody-rules-limit-popover";
+import { GateCtaLink } from "@components/system/gate-cta-link";
 import { Badge } from "@components/ui/badge";
 import { Button } from "@components/ui/button";
+import { Card } from "@components/ui/card";
 import { SvgKodyRulesDiscovery } from "@components/ui/icons/SvgKodyRulesDiscovery";
 import { Link } from "@components/ui/link";
 import { magicModal } from "@components/ui/magic-modal";
 import { Page } from "@components/ui/page";
-import { PopoverTrigger } from "@components/ui/popover";
 import { Skeleton } from "@components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@components/ui/tabs";
 import { toast } from "@components/ui/toaster/use-toast";
 import { useAsyncAction } from "@hooks/use-async-action";
 import { KODY_RULES_PATHS } from "@services/kodyRules";
 import { changeStatusKodyRules } from "@services/kodyRules/fetch";
-import {
-    useKodyRulesLimits,
-    useSuspenseKodyRulesPageData,
-} from "@services/kodyRules/hooks";
+import { useSuspenseKodyRulesPageData } from "@services/kodyRules/hooks";
 import {
     KodyRuleCentralizedStatus,
     KodyRuleRequestType,
@@ -35,6 +32,7 @@ import { isAxiosError } from "axios";
 import { PlusIcon } from "lucide-react";
 import { PageBoundary } from "src/core/components/page-boundary";
 import { useSelectedTeamId } from "src/core/providers/selected-team-context";
+import { captureGateHit } from "src/core/utils/gate-hit";
 import {
     compareRules,
     EMPTY_LIST_FILTERS,
@@ -68,6 +66,7 @@ import { BulkActionToolbar } from "./bulk-action-toolbar";
 import { BulkDeleteConfirmationModal } from "./bulk-delete-confirmation-modal";
 import { KodyRulesEmptyState } from "./empty";
 import { KodyKnowledgeApprovalSetting } from "./knowledge-approval";
+import { GlobalRulesSourceSetting } from "./global-rules-source-setting";
 import { KodyRulesList } from "./list";
 import { KodyRulesNoMatches } from "./no-matches";
 import { OrphanRulesChip } from "./orphan-rules-chip";
@@ -126,7 +125,6 @@ const KodyRulesPageContent = () => {
     const { repositoryId, directoryId } = useCodeReviewRouteParams();
     const queryClient = useQueryClient();
     const { teamId } = useSelectedTeamId();
-    const kodyRulesLimits = useKodyRulesLimits();
     const canEdit = usePermission(
         Action.Update,
         ResourceType.KodyRules,
@@ -175,6 +173,20 @@ const KodyRulesPageContent = () => {
         },
         { activeRules: [], pendingRules: [] },
     );
+
+    const lockedRulesCount = kodyRules.filter(
+        (rule) => rule.lockedByPlan,
+    ).length;
+
+    const gateReported = useRef(false);
+    useEffect(() => {
+        if (lockedRulesCount === 0 || gateReported.current) return;
+        gateReported.current = true;
+        captureGateHit({
+            feature: "kody_rules",
+            metadata: { surface: "locked_rules_list", lockedRulesCount },
+        });
+    }, [lockedRulesCount]);
 
     const isGlobalView = repositoryId === "global";
     const isRepoView = !isGlobalView && !directoryId;
@@ -229,27 +241,32 @@ const KodyRulesPageContent = () => {
     // Push filter state into the URL whenever it changes so refresh / share
     // restores it. Skips the very first run (before initial URL was parsed)
     // to avoid clobbering deep-link params during mount.
+    //
+    // Uses history.replaceState instead of router.replace: router.replace
+    // triggers an App Router navigation (RSC refetch + subtree re-render) on
+    // every keystroke, which steals focus from the search input — you'd have
+    // to click back into the field for each letter. history.replaceState
+    // updates the URL silently, so filters still survive refresh / share
+    // without remounting the input. We read the live URL (not the
+    // useSearchParams snapshot, which history.replaceState doesn't update) so
+    // the no-op guard stays accurate and unrelated params are preserved.
     useEffect(() => {
         if (!hasReadUrl) return;
-        const next = new URLSearchParams(searchParams?.toString() ?? "");
+        const currentStr = window.location.search.replace(/^\?/, "");
+        const next = new URLSearchParams(currentStr);
         applyFiltersToParams(next, {
             query: filterQuery,
             listFilters,
             onlyOrphans: onlyIdeSynced,
         });
         const nextStr = next.toString();
-        const currentStr = searchParams?.toString() ?? "";
         if (nextStr === currentStr) return;
-        router.replace(nextStr ? pathname + "?" + nextStr : pathname);
-    }, [
-        hasReadUrl,
-        filterQuery,
-        listFilters,
-        onlyIdeSynced,
-        pathname,
-        router,
-        searchParams,
-    ]);
+        window.history.replaceState(
+            null,
+            "",
+            nextStr ? pathname + "?" + nextStr : pathname,
+        );
+    }, [hasReadUrl, filterQuery, listFilters, onlyIdeSynced, pathname]);
 
     const ideRulesSyncEnabledForRepo =
         !isGlobalView &&
@@ -750,7 +767,13 @@ const KodyRulesPageContent = () => {
             return;
         }
 
-        const params = new URLSearchParams(searchParams.toString());
+        // Base off the live URL, not the useSearchParams snapshot: the filter
+        // sync writes with history.replaceState (see above), which doesn't
+        // refresh that snapshot, so reading it here would drop the current
+        // filter params when switching tabs.
+        const params = new URLSearchParams(
+            window.location.search.replace(/^\?/, ""),
+        );
         if (tab === DEFAULT_TAB) {
             params.delete(TAB_QUERY_PARAM);
         } else {
@@ -855,33 +878,23 @@ const KodyRulesPageContent = () => {
                                 </Link>
                             )}
 
-                            {kodyRulesLimits.canAddMoreRules ? (
-                                <Button
-                                    size="md"
-                                    type="button"
-                                    variant="primary"
-                                    leftIcon={<PlusIcon />}
-                                    disabled={!canEdit}
-                                    onClick={() =>
-                                        addNewEmptyRule(activeRuleType)
-                                    }>
-                                    New {currentEntityLabel}
-                                </Button>
-                            ) : (
-                                <KodyRulesLimitPopover
-                                    limit={kodyRulesLimits.limit}>
-                                    <PopoverTrigger asChild>
-                                        <Button
-                                            size="md"
-                                            type="button"
-                                            variant="primary"
-                                            leftIcon={<PlusIcon />}
-                                            disabled={!canEdit}>
-                                            New {currentEntityLabel}
-                                        </Button>
-                                    </PopoverTrigger>
-                                </KodyRulesLimitPopover>
-                            )}
+                            {/* Creating is never blocked — a rule beyond
+                                the free plan's active-rule cap is still
+                                created, just PAUSED + locked (see the
+                                "N of your Kody Rules are locked" banner
+                                below), mirroring how MCP plugins beyond
+                                their cap stay connected but locked. */}
+                            <Button
+                                size="md"
+                                type="button"
+                                variant="primary"
+                                leftIcon={<PlusIcon />}
+                                disabled={!canEdit}
+                                onClick={() =>
+                                    addNewEmptyRule(activeRuleType)
+                                }>
+                                New {currentEntityLabel}
+                            </Button>
                         </Page.HeaderActions>
                     </div>
                 )}
@@ -889,6 +902,34 @@ const KodyRulesPageContent = () => {
 
             <Page.Content>
                 <CentralizedConfigReadOnlyAlert />
+
+                {lockedRulesCount > 0 && (
+                    <Card
+                        color="lv1"
+                        className="flex flex-row items-center justify-between gap-6 p-5">
+                        <div className="flex flex-col gap-1">
+                            <span className="text-text-primary text-sm font-semibold">
+                                {lockedRulesCount} of your Kody Rules{" "}
+                                {lockedRulesCount === 1 ? "is" : "are"} locked
+                            </span>
+                            <span className="text-text-secondary text-sm">
+                                The Free plan runs 10 active rules — locked
+                                rules stay in your list but are skipped on
+                                every PR. Upgrade to activate them all, plus
+                                unlimited plugins and the Cockpit.
+                            </span>
+                        </div>
+                        <GateCtaLink
+                            feature="kody_rules"
+                            metadata={{
+                                surface: "locked_rules_banner",
+                                lockedRulesCount,
+                            }}
+                            size="sm"
+                            className="shrink-0"
+                        />
+                    </Card>
+                )}
                 <Tabs value={activeTab} onValueChange={handleTabChange}>
                     <TabsList>
                         <TabsTrigger value="review-rules">
@@ -1135,6 +1176,13 @@ const KodyRulesPageContent = () => {
                                 <Suspense
                                     fallback={<Skeleton className="h-15" />}>
                                     <GenerateRulesOptions />
+                                </Suspense>
+                            )}
+
+                            {isGlobalView && (
+                                <Suspense
+                                    fallback={<Skeleton className="h-15" />}>
+                                    <GlobalRulesSourceSetting />
                                 </Suspense>
                             )}
                         </div>

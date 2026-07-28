@@ -1,31 +1,43 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { produce } from 'immer';
 import { AgentReviewStage } from '@/code-review/pipeline/stages/agent-review.stage';
 import { ReviewOrchestratorService } from '@/code-review/infrastructure/agents/review-orchestrator.service';
 import { ObservabilityService } from '@/core/log/observability.service';
 import { AUTOMATION_EXECUTION_SERVICE_TOKEN } from '@/automation/domain/automationExecution/contracts/automation-execution.service';
 import { GraphContextService } from '@/code-review/infrastructure/adapters/services/graph/graph-context.service';
+import { FeatureGateService } from '@libs/feature-gate';
+import { ORGANIZATION_SERVICE_TOKEN } from '@libs/organization/domain/organization/contracts/organization.service.contract';
 import { REPOSITORY_SERVICE_TOKEN } from '@/code-review/domain/contracts/RepositoryService.contract';
 import { CodeReviewPipelineContext } from '@/code-review/pipeline/context/code-review-pipeline.context';
 import { PlatformType } from '@/core/domain/enums';
 import { CodeReviewVersion } from '@/core/domain/enums/code-review.enum';
 
 const mockTracedGenerateText = jest.fn();
-const mockWithStructuredOutputFallback = jest.fn();
+// Default: run the caller's `exec(model)` so dedup still hits mockTracedGenerateText.
+// Both BYOK and non-BYOK paths now go through withStructuredOutputFallback.
+const mockWithStructuredOutputFallback = jest.fn(
+    async (_params: any, exec: (model: any) => Promise<any>) =>
+        exec({ __mockModel: true }),
+) as jest.Mock;
+
+// tracedGenerateText was relocated from the legacy agent-loop to @libs/llm/llm-call
+// during the llm migration; mock it there so the stage's dedup LLM call is
+// intercepted (preserve the module's other exports, e.g. AGENT_TIMEOUT_MS).
+jest.mock('@libs/llm/llm-call', () => ({
+    ...jest.requireActual('@libs/llm/llm-call'),
+    tracedGenerateText: (...args: any[]) => mockTracedGenerateText(...args),
+}));
 
 jest.mock(
-    '@libs/code-review/infrastructure/agents/llm/agent-loop',
-    () => ({
-        tracedGenerateText: (...args: any[]) => mockTracedGenerateText(...args),
-    }),
-);
-
-jest.mock(
-    '@libs/code-review/infrastructure/agents/llm/byok-to-vercel',
+    '@libs/llm/byok-to-vercel',
     () => ({
         withStructuredOutputFallback: (...args: any[]) =>
             mockWithStructuredOutputFallback(...args),
         NoStructuredFallbackModelError: class extends Error {},
         getModelName: jest.fn().mockReturnValue('test-model'),
+        // Used by resolveSecondaryPassModel when platform OpenAI key is absent.
+        getInternalModel: jest.fn().mockReturnValue({ __mockModel: 'internal' }),
+        byokToVercelModel: jest.fn().mockReturnValue({ __mockModel: 'byok' }),
     }),
 );
 
@@ -42,7 +54,7 @@ jest.mock('ai', () => ({
     tool: (opts: any) => opts,
 }));
 
-jest.mock('@kodus/flow', () => ({
+jest.mock('@libs/core/log/logger', () => ({
     createLogger: () => ({
         log: jest.fn(),
         error: jest.fn(),
@@ -149,6 +161,7 @@ describe('AgentReviewStage', () => {
                     provide: ObservabilityService,
                     useValue: {
                         runInSpan: jest.fn((_name: string, fn: any) => fn()),
+                        recordAgentRunUsage: jest.fn(),
                     },
                 },
                 {
@@ -172,6 +185,20 @@ describe('AgentReviewStage', () => {
                         findOrCreate: jest.fn(),
                         findByExternalId: jest.fn(),
                         updateStatus: jest.fn(),
+                    },
+                },
+                {
+                    // HEAVY is an alpha-gated opt-in; default the gate to OFF so
+                    // these tests exercise the normal review path.
+                    provide: FeatureGateService,
+                    useValue: {
+                        isEnabled: jest.fn().mockResolvedValue(false),
+                    },
+                },
+                {
+                    provide: ORGANIZATION_SERVICE_TOKEN,
+                    useValue: {
+                        getReleaseTrack: jest.fn().mockResolvedValue('beta'),
                     },
                 },
             ],
@@ -330,6 +357,34 @@ describe('AgentReviewStage', () => {
                 expect(fileResult.discardedSuggestionsBySafeGuard).toEqual([]);
             }
         });
+
+        it('should not throw when the context is Immer-frozen (regression)', async () => {
+            // In production the pipeline context is Immer-frozen (auto-freeze)
+            // once it has passed through an earlier stage's produce(). A direct
+            // `context.heavy = …` assignment threw "Cannot assign to read only
+            // property 'heavy'", which the stage caught and swallowed as an
+            // empty-results agent failure — the whole review finished in
+            // seconds with zero suggestions. Freeze the context the same way
+            // here so a regression to direct mutation is caught by the suite.
+            const frozenContext = produce(
+                createBaseContext({
+                    changedFiles: [
+                        { filename: 'src/auth.ts', patch: '+code' } as any,
+                    ],
+                    sandboxHandle: undefined,
+                }),
+                () => {},
+            );
+
+            const result = await (stage as any).executeStage(frozenContext);
+
+            // The orchestrator must actually run (not be short-circuited by a
+            // thrown TypeError) and heavy must persist onto the returned
+            // context for the downstream create-file-comments stage.
+            expect(mockOrchestrator.execute).toHaveBeenCalledTimes(1);
+            expect(result.fileAnalysisResults).toBeDefined();
+            expect(result.heavy).toBe(false);
+        });
     });
 
     describe('kody rules severity', () => {
@@ -358,7 +413,9 @@ describe('AgentReviewStage', () => {
                     },
                 ],
                 failures: [],
+                incomplete: [],
                 totalDurationMs: 1000,
+                warnings: [],
             });
 
             const context = createBaseContext({
@@ -432,6 +489,7 @@ describe('AgentReviewStage', () => {
         });
 
         it('should handle undefined agentResults without throwing', async () => {
+            // Deliberately malformed (undefined agentResults) to test resilience.
             mockOrchestrator.execute.mockResolvedValue({
                 suggestions: [
                     {
@@ -444,8 +502,10 @@ describe('AgentReviewStage', () => {
                     },
                 ],
                 agentResults: undefined,
+                failures: [],
                 totalDurationMs: 1000,
-            });
+                warnings: [],
+            } as any);
 
             const context = createBaseContext({
                 changedFiles: [{ filename: 'src/auth.ts' } as any],
@@ -471,6 +531,140 @@ describe('AgentReviewStage', () => {
             expect(result.fileAnalysisResults[0].validSuggestionsToAnalyze).toHaveLength(1);
         });
 
+    });
+
+    /**
+     * The stage returns rather than throwing, so nothing downstream sees a
+     * thrown error — everything it knows about a bad run has to be in
+     * `context.errors`. An empty errors array on a run that produced no
+     * suggestions is read downstream as "the code is clean" and auto-approves
+     * the PR, which is how a dead LLM provider shipped as a green review
+     * (#1568).
+     */
+    describe('failure reporting', () => {
+        const contextWithFiles = () =>
+            createBaseContext({
+                changedFiles: [{ filename: 'src/index.ts' } as any],
+            });
+
+        it('records a critical error when the orchestrator throws', async () => {
+            mockOrchestrator.execute.mockRejectedValue(
+                Object.assign(new Error('Path not found: /chat/completions'), {
+                    name: 'AI_APICallError',
+                    statusCode: 404,
+                }),
+            );
+
+            const result = await (stage as any).executeStage(
+                contextWithFiles(),
+            );
+
+            expect(result.errors).toHaveLength(1);
+            expect(result.errors[0].severity).toBe('critical');
+        });
+
+        it('records a critical error when post-orchestrator processing throws', async () => {
+            mockOrchestrator.execute.mockResolvedValue({
+                get suggestions(): any {
+                    throw new Error('boom while mapping results');
+                },
+                agentResults: [],
+                failures: [],
+                incomplete: [],
+                totalDurationMs: 10,
+                warnings: [],
+            } as any);
+
+            const result = await (stage as any).executeStage(
+                contextWithFiles(),
+            );
+
+            expect(result.errors).toHaveLength(1);
+            expect(result.errors[0].severity).toBe('critical');
+        });
+
+        it('classifies the failure so the PR comment can name the cause', async () => {
+            mockOrchestrator.execute.mockRejectedValue(
+                Object.assign(new Error('model not found'), {
+                    statusCode: 404,
+                }),
+            );
+
+            const result = await (stage as any).executeStage(
+                contextWithFiles(),
+            );
+
+            expect(result.lastReviewError?.friendlyMessage).toBeTruthy();
+        });
+
+        it('records a partial error when a core agent hit its budget ceiling', async () => {
+            mockOrchestrator.execute.mockResolvedValue({
+                suggestions: [],
+                agentResults: [],
+                failures: [],
+                incomplete: [
+                    {
+                        agentName: 'generalist',
+                        category: 'generalist',
+                        finishReason: 'timeout',
+                        suggestionsFound: 0,
+                        durationMs: 1_800_000,
+                    },
+                ],
+                totalDurationMs: 1_800_000,
+                warnings: [],
+            } as any);
+
+            const result = await (stage as any).executeStage(
+                contextWithFiles(),
+            );
+
+            expect(result.errors).toHaveLength(1);
+            expect(result.errors[0].severity).toBe('partial');
+            expect(result.errors[0].metadata.finishReason).toBe('timeout');
+        });
+
+        it('ignores a truncated kody-rules agent — auxiliary, not review-gating', async () => {
+            mockOrchestrator.execute.mockResolvedValue({
+                suggestions: [],
+                agentResults: [],
+                failures: [],
+                incomplete: [
+                    {
+                        agentName: 'kody-rules',
+                        category: 'kody_rules',
+                        finishReason: 'max-steps',
+                        suggestionsFound: 0,
+                        durationMs: 1000,
+                    },
+                ],
+                totalDurationMs: 1000,
+                warnings: [],
+            } as any);
+
+            const result = await (stage as any).executeStage(
+                contextWithFiles(),
+            );
+
+            expect(result.errors ?? []).toHaveLength(0);
+        });
+
+        it('records nothing on a clean run that genuinely found no issues', async () => {
+            mockOrchestrator.execute.mockResolvedValue({
+                suggestions: [],
+                agentResults: [],
+                failures: [],
+                incomplete: [],
+                totalDurationMs: 1000,
+                warnings: [],
+            } as any);
+
+            const result = await (stage as any).executeStage(
+                contextWithFiles(),
+            );
+
+            expect(result.errors ?? []).toHaveLength(0);
+        });
     });
 
     describe('writeAgentTrace - race condition (Bug 2)', () => {
@@ -689,6 +883,12 @@ describe('AgentReviewStage', () => {
         beforeEach(() => {
             mockTracedGenerateText.mockReset();
             mockWithStructuredOutputFallback.mockReset();
+            // mockReset clears the default implementation — restore the
+            // exec-forwarding behavior both secondary paths rely on.
+            mockWithStructuredOutputFallback.mockImplementation(
+                async (_params: any, exec: (model: any) => Promise<any>) =>
+                    exec({ __mockModel: true }),
+            );
         });
 
         it('content guard: keeps a low-similarity "duplicate" the model over-merged', async () => {
@@ -756,6 +956,24 @@ describe('AgentReviewStage', () => {
                 expect(result.suggestions[0].suggestionContent).toContain('Also found in');
             } finally {
                 if (origKey === undefined) delete process.env.API_OPEN_AI_API_KEY;
+                else process.env.API_OPEN_AI_API_KEY = origKey;
+            }
+        });
+
+        it('fails loud (re-throws) on an unexpected dedup error outside production', async () => {
+            // Guard against the `googleKey`-class bug: a programming error must
+            // NOT be swallowed into a silent 'failed-keep-all' in dev/CI/test.
+            const suggestions = makeSuggestions(2);
+            mockTracedGenerateText.mockRejectedValue(new Error('boom'));
+            const origKey = process.env.API_OPEN_AI_API_KEY;
+            process.env.API_OPEN_AI_API_KEY = 'test-key';
+            try {
+                await expect(
+                    (stage as any).deduplicateSuggestions(suggestions, 42),
+                ).rejects.toThrow('boom');
+            } finally {
+                if (origKey === undefined)
+                    delete process.env.API_OPEN_AI_API_KEY;
                 else process.env.API_OPEN_AI_API_KEY = origKey;
             }
         });

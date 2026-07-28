@@ -13,8 +13,10 @@ import {
     DailyUsageByPrResultContract,
     DailyUsageResultContract,
     TokenUsageQueryContract,
+    UsageByAreaResultContract,
     UsageByDeveloperResultContract,
     UsageByPrResultContract,
+    UsageByReviewResultContract,
     UsageSummaryReportContract,
 } from '@libs/analytics/domain/token-usage/types/tokenUsage.types';
 import { UserRequest } from '@libs/core/infrastructure/config/types/http/user-request.type';
@@ -54,8 +56,10 @@ import {
     DailyUsageByDeveloperResponseDto,
     DailyUsageByPrResponseDto,
     DailyUsageResponseDto,
+    UsageByAreaResponseDto,
     UsageByDeveloperResponseDto,
     UsageByPrResponseDto,
+    UsageByReviewResponseDto,
     UsageSummaryResponseDto,
 } from '../dtos/token-usage-response.dto';
 
@@ -109,6 +113,31 @@ export class TokenUsageController {
             teamId: '',
         });
         return this.buildUsageSummaryUseCase.execute(
+            mapped,
+            config?.modelPricing,
+        );
+    }
+
+    @Get('tokens/overview')
+    @ApiOperation({
+        summary: 'Get token usage overview (single request)',
+        description:
+            'Return summary (totals + cost + per-model) plus daily and by-PR series in ONE covered aggregation. Replaces the separate summary/daily/by-pr calls the screen used to fire.',
+    })
+    @ApiOkResponse({ type: UsageSummaryResponseDto })
+    async getOverview(@Query() query: TokenUsageQueryDto) {
+        const organizationId = this.request?.user?.organization?.uuid;
+
+        if (!organizationId) {
+            throw new BadRequestException('organizationId not found in request');
+        }
+
+        const mapped = this.mapDtoToContract(query, organizationId);
+        const config = await this.spendLimitConfigService.getConfig({
+            organizationId,
+            teamId: '',
+        });
+        return this.buildUsageSummaryUseCase.executeOverview(
             mapped,
             config?.modelPricing,
         );
@@ -171,6 +200,46 @@ export class TokenUsageController {
         return await this.tokenUsageService.getDailyUsageByPr(mapped);
     }
 
+    @Get('tokens/by-review')
+    @ApiOperation({
+        summary: 'Get token usage by review run',
+        description:
+            'Return token usage aggregated per individual review run (correlationId). A PR reviewed more than once yields one row per run.',
+    })
+    @ApiOkResponse({ type: UsageByReviewResponseDto })
+    async getUsageByReview(
+        @Query() query: TokenUsageQueryDto,
+    ): Promise<UsageByReviewResultContract[]> {
+        const organizationId = this.request?.user?.organization?.uuid;
+
+        if (!organizationId) {
+            throw new BadRequestException('organizationId not found in request');
+        }
+
+        const mapped = this.mapDtoToContract(query, organizationId);
+        return await this.tokenUsageService.getUsageByReview(mapped);
+    }
+
+    @Get('tokens/by-area')
+    @ApiOperation({
+        summary: 'Get token usage by process area',
+        description:
+            'Return token usage aggregated by the area of the review process that spent it (review, kody_rules, cross_file, …).',
+    })
+    @ApiOkResponse({ type: UsageByAreaResponseDto })
+    async getUsageByArea(
+        @Query() query: TokenUsageQueryDto,
+    ): Promise<UsageByAreaResultContract[]> {
+        const organizationId = this.request?.user?.organization?.uuid;
+
+        if (!organizationId) {
+            throw new BadRequestException('organizationId not found in request');
+        }
+
+        const mapped = this.mapDtoToContract(query, organizationId);
+        return await this.tokenUsageService.getUsageByArea(mapped);
+    }
+
     @Get('tokens/by-developer')
     @ApiOperation({
         summary: 'Get token usage by developer',
@@ -228,6 +297,39 @@ export class TokenUsageController {
         );
     }
 
+    @Get('tokens/pricing/batch')
+    @ApiOperation({
+        summary: 'Get token pricing for many models (single request)',
+        description:
+            'Resolve pricing for a comma-separated list of models in ONE request (LiteLLM catalog is fetched once). Replaces the per-model pricing N+1 the screen used to fire.',
+    })
+    @ApiOkResponse({ type: ApiObjectResponseDto })
+    async getPricingBatch(
+        @Query('models') models?: string,
+        @Query('provider') provider?: string,
+    ) {
+        const organizationId = this.request?.user?.organization?.uuid;
+
+        if (!organizationId) {
+            throw new BadRequestException('organizationId not found in request');
+        }
+
+        const list = (models ?? '')
+            .split(',')
+            .map((m) => m.trim())
+            .filter(Boolean);
+        // Cap the batch: an authenticated caller could otherwise send a huge
+        // list and force an unbounded number of catalog lookups per request
+        // (DoS). The screen only ever asks for the models in its breakdown.
+        const MAX_BATCH_MODELS = 100;
+        if (list.length > MAX_BATCH_MODELS) {
+            throw new BadRequestException(
+                `Too many models (max ${MAX_BATCH_MODELS} per request)`,
+            );
+        }
+        return this.tokenPricingUseCase.executeMany(list, provider);
+    }
+
     @Get('cost-estimate')
     @ApiOperation({
         summary: 'Get cost estimate',
@@ -280,6 +382,7 @@ export class TokenUsageController {
             end,
             timezone: query.timezone || 'UTC',
             developer: query.developer,
+            repositoryId: query.repositoryId,
             models: query.models,
             byok: byokBoolean,
         };

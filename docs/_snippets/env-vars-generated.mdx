@@ -14,6 +14,7 @@
 | `RELEASE_VERSION` | – | string | ☁️ Cloud | Released version tag, set by CI on prod builds. |
 | `KODUS_LICENSE_KEY` | – | secret | 🏢 Self-hosted Enterprise | Self-hosted license key. Unlocks enterprise features. EE-only — documented in the docs reference; does not appear in either default .env.example. |
 | `API_DEVELOPMENT_MODE` | – | boolean | ☁️ Cloud | Dev-only bypass of permission validation. Cloud devs only. |
+| `GLOBAL_RULES_IMPORT_TIER_OVERRIDE` | – | enum=free|trial|paid | ☁️ Cloud | Dev-only override for the global Kody Rules import tier so the free/trial/paid UI can be exercised locally (where an install usually has no license and would otherwise resolve to `free`). Only honored when API_DEVELOPMENT_MODE is true; ignored in production. Leave empty to resolve the tier from the org's license as usual. |
 | `RUN_MIGRATIONS` | – | boolean | ⚙️ Both | Run TypeORM migrations on container boot (OLTP + analytics warehouse + mcp-manager). Default true so a fresh install boots into a usable state without an extra step. Set to false to manage migrations manually (e.g. blue/green deploys where you run them out-of-band). |
 | `RUN_SEEDS` | – | boolean | ⚙️ Both | Run database seeds on container boot. Required for first-time setup (creates default org, admin role, etc). Idempotent — safe to leave on. |
 | `USE_LOCAL_DB` | – | boolean | 🏠 Self-hosted | When true, the installer's docker-compose spins up a local Postgres container. Set to false to point at an externally-managed Postgres (managed RDS/Supabase/Neon/Railway). Read by kodus-installer/scripts/ install.sh + doctor.sh; not consumed by kodus-ai itself. |
@@ -154,6 +155,7 @@
 
 | Variable | Required | Type | Scope | Description |
 | --- | --- | --- | --- | --- |
+| `OBSERVABILITY_MONGO_ENABLED` | – | boolean | ⚙️ Both (opt-in) | Enables the MongoDB observability exporter used for logs/telemetry persistence. Set to false to disable Mongo observability writes without disabling the application's MongoDB connection itself. |
 | `LANGFUSE_TRACING` | – | boolean | ⚙️ Both (opt-in) | Langfuse tracing — opt-in for self-hosted (cloud Langfuse needs the user's own keys; default is to leave it off in self-hosted). |
 | `LANGFUSE_PUBLIC_KEY` | – | string | ⚙️ Both (opt-in) |  |
 | `LANGFUSE_SECRET_KEY` | – | secret | ⚙️ Both (opt-in) |  |
@@ -315,9 +317,7 @@
 | `API_MCP_MANAGER_DATABASE_ENV` | – | string | 🏠 Self-hosted |  |
 | `API_MCP_MANAGER_CORS_ORIGINS` | – | string | 🏠 Self-hosted | Comma-separated allowed origins for the MCP Manager HTTP server. |
 | `API_MCP_MANAGER_JWT_SECRET` | – | secret | 🏠 Self-hosted | Generate with: openssl rand -base64 32 |
-| `API_MCP_MANAGER_COMPOSIO_BASE_URL` | – | url | 🏠 Self-hosted | Composio (third-party MCP marketplace) — optional, leave empty to disable. |
-| `API_MCP_MANAGER_COMPOSIO_API_KEY` | – | secret | 🏠 Self-hosted |  |
-| `API_MCP_MANAGER_MCP_PROVIDERS` | – | string | 🏠 Self-hosted | Comma-separated list of MCP providers to enable: kodusmcp,composio,custom. |
+| `API_MCP_MANAGER_MCP_PROVIDERS` | – | string | 🏠 Self-hosted | Comma-separated list of MCP providers to enable: kodusmcp,custom. |
 | `API_MCP_MANAGER_REDIRECT_URI` | – | url | 🏠 Self-hosted | OAuth redirect URI used by MCP Manager when wiring providers via the web UI. |
 | `API_MCP_MANAGER_PG_DB_SCHEMA` | – | string | 🏠 Self-hosted | Postgres schema name used by MCP Manager (shares the main DB). |
 | `API_MCP_MANAGER_ENCRYPTION_SECRET` | – | secret | ⚙️ Both | Symmetric key used by MCP Manager to encrypt tokens at rest. Generate with: openssl rand -base64 32 |
@@ -347,6 +347,9 @@
 | --- | --- | --- | --- | --- |
 | `API_CRON_CLASSIFY_ORPHANED_SESSIONS` | – | cron | ⚙️ Both | Reclassifies orphaned (no-PR) review sessions every 15 minutes. Cloud-only feature. |
 | `API_CRON_SSO_TEST_SESSION_CLEANUP` | – | cron | ☁️ Cloud | Daily cleanup of expired SSO test sessions (1 AM UTC). |
+| `API_CRON_STALE_REVIEW_WATCHDOG` | – | cron | ⚙️ Both | Reaps code review executions stuck IN_PROGRESS (process died mid-review) and finalizes their orphaned platform check runs. |
+| `WORKFLOW_STALE_JOB_REAPER_CRON` | – | cron | ⚙️ Both | Cadence of the workflow-jobs stale-PROCESSING reaper, which fails jobs left in PROCESSING when a worker was killed mid-processing (OOM/eviction). The eligibility threshold (WORKFLOW_STALE_JOB_TIMEOUT_MINUTES) still bounds what can be reaped, so cadence only affects how quickly orphans are caught. |
+| `WORKFLOW_STALE_JOB_TIMEOUT_MINUTES` | – | number | ⚙️ Both | Minutes a workflow job may sit in PROCESSING before the reaper marks it FAILED. Must exceed the longest legitimate run — the 105min job-abort timeout and the 150min inbox claim timeout — so live jobs are never reaped; 180 leaves margin. |
 | `WORKFLOW_QUEUE_CHECK_IMPLEMENTATION_PREFETCH` | – | number | ⚙️ Both (opt-in) | Per-handler prefetch (in-flight messages) for the check-implementation workflow handler. |
 | `WORKFLOW_QUEUE_CHECK_IMPLEMENTATION_TIMEOUT_MS` | – | number | ⚙️ Both (opt-in) | Hard timeout (ms) for a check-implementation handler invocation. |
 | `WORKFLOW_QUEUE_FEEDBACK_PREFETCH` | – | number | ⚙️ Both (opt-in) | Per-handler prefetch for the feedback workflow handler. |

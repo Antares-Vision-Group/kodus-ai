@@ -11,6 +11,7 @@ import {
     FindMemoriesFilters,
     FindMemoriesResult,
     IKodyRule,
+    IKodyRuleDetector,
     IKodyRuleMemory,
     KodyRulesStatus,
 } from '../interfaces/kodyRules.interface';
@@ -78,6 +79,16 @@ export interface IKodyRulesService extends IKodyRulesRepository {
         },
     ): Promise<IKodyRule | null>;
 
+    /**
+     * Persist the T0 compiled detector onto an embedded rule (#1449). Passing
+     * `null` clears it (rule reverts to semantic). Mirrors updateRuleReferences.
+     */
+    updateRuleDetector(
+        organizationId: string,
+        ruleId: string,
+        detector: IKodyRuleDetector | null,
+    ): Promise<IKodyRule | null>;
+
     getRulesLimitStatus(
         organizationAndTeamData: OrganizationAndTeamData,
     ): Promise<{
@@ -93,10 +104,6 @@ export interface IKodyRulesService extends IKodyRulesRepository {
             count: number;
         }>
     >;
-
-    getRecommendedRulesByMCP(
-        organizationAndTeamData: OrganizationAndTeamData,
-    ): Promise<LibraryKodyRule[]>;
 
     getRecommendedRulesBySuggestions(
         organizationAndTeamData: OrganizationAndTeamData,

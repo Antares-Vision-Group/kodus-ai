@@ -1,27 +1,23 @@
 import {
-    BadRequestException,
     forwardRef,
     Inject,
     Injectable,
     NotFoundException,
+    Optional,
 } from '@nestjs/common';
+import { KodyRuleSummaryService } from '@libs/kodyRules/infrastructure/adapters/services/kody-rule-summary.service';
 import { v4 } from 'uuid';
 import bucketsData from './data/buckets.json';
 import libraryKodyRules from './data/library-kody-rules.json';
 
-import { createLogger } from '@kodus/flow';
+import { createLogger } from '@libs/core/log/logger';
 import { CentralizedConfigPrService } from '@libs/centralized-config/infrastructure/adapters/services/centralized-config-pr.service';
 import { ModuleRef } from '@nestjs/core';
 import {
     buildKodyRuleCentralizedFilePath,
     buildKodyRuleCentralizedMutationRequest,
 } from '@libs/centralized-config/utils/kody-rules-centralized-pr.builder';
-import {
-    LLMModelProvider,
-    ParserType,
-    PromptRole,
-    PromptRunnerService,
-} from '@kodus/kodus-common/llm';
+import { PromptRunnerService } from '@kodus/kodus-common/llm';
 import {
     CODE_BASE_CONFIG_SERVICE_TOKEN,
     ICodeBaseConfigService,
@@ -43,8 +39,8 @@ import {
     LibraryKodyRule,
 } from '@libs/core/infrastructure/config/types/general/kodyRules.type';
 import { OrganizationAndTeamData } from '@libs/core/infrastructure/config/types/general/organizationAndTeamData';
-import { BYOKPromptRunnerService } from '@libs/core/infrastructure/services/tokenTracking/byokPromptRunner.service';
 import { ObservabilityService } from '@libs/core/log/observability.service';
+import { runStructuredReviewCall } from '@libs/llm/structured-review-call';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { AuditLogEvents } from '@libs/ee/codeReviewSettingsLog/events/audit-log.events';
 import {
@@ -69,6 +65,7 @@ import {
     FindMemoriesFilters,
     FindMemoriesResult,
     IKodyRule,
+    IKodyRuleDetector,
     IKodyRuleMemory,
     IKodyRules,
     KodyRuleCentralizedStatus,
@@ -140,7 +137,52 @@ export class KodyRulesService implements IKodyRulesService {
 
         @Inject(forwardRef(() => CODE_BASE_CONFIG_SERVICE_TOKEN))
         private readonly codeBaseConfigService: ICodeBaseConfigService,
+
+        // Optional so existing manual instantiations/specs keep working; when
+        // absent the summary hook is simply skipped (lazy backfill in the
+        // review path covers it).
+        @Optional()
+        private readonly kodyRuleSummaryService?: KodyRuleSummaryService,
     ) {}
+
+    /**
+     * Fire-and-forget summary generation for a just-written LONG rule.
+     * Detached from the request (setImmediate + captured plain values — no
+     * request-scoped references, see the finish-onboarding 504 postmortem) so
+     * writes never wait on an LLM. Short rules never reach generation;
+     * ensureAtoms also no-ops when a fresh decomposition already exists.
+     */
+    private scheduleSummaryGeneration(
+        organizationAndTeamData: OrganizationAndTeamData,
+        rule: Partial<IKodyRule>,
+    ): void {
+        if (!this.kodyRuleSummaryService?.isLong(rule.rule)) {
+            return;
+        }
+        const summaryService = this.kodyRuleSummaryService;
+        const orgData: OrganizationAndTeamData = {
+            organizationId: organizationAndTeamData.organizationId,
+            teamId: organizationAndTeamData.teamId,
+        };
+        const snapshot: Partial<IKodyRule> = { ...rule };
+        setImmediate(() => {
+            summaryService.ensureAtoms([snapshot], orgData).catch((error) =>
+                this.logger.warn({
+                    message:
+                        '[kody-rule-summary] background generation failed after rule write',
+                    context: KodyRulesService.name,
+                    metadata: {
+                        organizationId: orgData.organizationId,
+                        ruleUuid: rule.uuid,
+                        error:
+                            error instanceof Error
+                                ? error.message
+                                : String(error),
+                    },
+                }),
+            );
+        });
+    }
 
     // CCP é request-scoped (depende transitivamente de algo
     // request-scoped, provavelmente codeManagementService com token
@@ -197,6 +239,10 @@ export class KodyRulesService implements IKodyRulesService {
         organizationId: string,
     ): Promise<KodyRulesEntity | null> {
         return this.kodyRulesRepository.findByOrganizationId(organizationId);
+    }
+
+    async findOrganizationIdsWithRules(): Promise<string[]> {
+        return this.kodyRulesRepository.findOrganizationIdsWithRules();
     }
 
     /**
@@ -326,10 +372,12 @@ export class KodyRulesService implements IKodyRulesService {
                 throw new NotFoundException('Rule not found');
             }
 
-            await this.ensureFreePlanLimit(
-                organizationAndTeamData,
-                newRuleCountsTowardQuota ? 1 : 0,
-            );
+            const { status: resolvedStatus, lockedByPlan } =
+                await this.resolveStatusWithinPlanLimit(
+                    organizationAndTeamData,
+                    kodyRule?.status ?? KodyRulesStatus.ACTIVE,
+                    newRuleCountsTowardQuota ? 1 : 0,
+                );
 
             const newRule: IKodyRule = {
                 uuid: v4(),
@@ -338,11 +386,14 @@ export class KodyRulesService implements IKodyRulesService {
                 rule: kodyRule?.rule,
                 path: kodyRule?.path,
                 severity: kodyRule?.severity?.toLowerCase(),
-                status: kodyRule?.status ?? KodyRulesStatus.ACTIVE,
+                status: resolvedStatus,
+                lockedByPlan,
                 sourcePath: kodyRule?.sourcePath,
                 centralizedConfig: kodyRule?.centralizedConfig,
                 sourceAnchor: kodyRule?.sourceAnchor,
                 repositoryId: kodyRule?.repositoryId,
+                sourceRepositoryId: kodyRule?.sourceRepositoryId,
+                lastContentHash: kodyRule?.lastContentHash,
                 directoryId: kodyRule?.directoryId,
                 examples: kodyRule?.examples,
                 origin: kodyRule?.origin ?? KodyRulesOrigin.MANUAL,
@@ -390,6 +441,8 @@ export class KodyRulesService implements IKodyRulesService {
                 newRule,
             );
 
+            this.scheduleSummaryGeneration(organizationAndTeamData, newRule);
+
             return newKodyRules.rules[0];
         }
 
@@ -405,10 +458,12 @@ export class KodyRulesService implements IKodyRulesService {
             const activeRulesCount = (existing.rules ?? []).filter(
                 (r) => r.status === KodyRulesStatus.ACTIVE,
             ).length;
-            await this.ensureFreePlanLimit(
-                organizationAndTeamData,
-                activeRulesCount + (newRuleCountsTowardQuota ? 1 : 0),
-            );
+            const { status: resolvedStatus, lockedByPlan } =
+                await this.resolveStatusWithinPlanLimit(
+                    organizationAndTeamData,
+                    kodyRule.status ?? KodyRulesStatus.ACTIVE,
+                    activeRulesCount + (newRuleCountsTowardQuota ? 1 : 0),
+                );
 
             const newRule: IKodyRule = {
                 uuid: v4(),
@@ -420,8 +475,11 @@ export class KodyRulesService implements IKodyRulesService {
                 centralizedConfig: kodyRule.centralizedConfig,
                 sourceAnchor: kodyRule.sourceAnchor,
                 severity: kodyRule.severity?.toLowerCase(),
-                status: kodyRule.status ?? KodyRulesStatus.ACTIVE,
+                status: resolvedStatus,
+                lockedByPlan,
                 repositoryId: kodyRule?.repositoryId,
+                sourceRepositoryId: kodyRule?.sourceRepositoryId,
+                lastContentHash: kodyRule?.lastContentHash,
                 directoryId: kodyRule?.directoryId,
                 examples: kodyRule?.examples,
                 origin: kodyRule?.origin ?? KodyRulesOrigin.MANUAL,
@@ -465,6 +523,8 @@ export class KodyRulesService implements IKodyRulesService {
                 newRule,
             );
 
+            this.scheduleSummaryGeneration(organizationAndTeamData, newRule);
+
             return updatedKodyRules.rules.find(
                 (rule) => rule.uuid === newRule.uuid,
             );
@@ -479,9 +539,14 @@ export class KodyRulesService implements IKodyRulesService {
             throw new NotFoundException('Rule not found');
         }
 
-        // When unpausing (changing from non-ACTIVE to ACTIVE), enforce the
+        // When unpausing (changing from non-ACTIVE to ACTIVE), re-check the
         // free-plan quota so the user can't bypass the 10-rule limit by
-        // pausing and creating new rules.
+        // pausing and creating new rules — if the org is still over quota,
+        // the rule stays PAUSED (lockedByPlan) instead of reactivating.
+        let statusOverride: Partial<
+            Pick<IKodyRule, 'status' | 'lockedByPlan'>
+        > = {};
+
         if (
             kodyRule.status === KodyRulesStatus.ACTIVE &&
             existingRule.status !== KodyRulesStatus.ACTIVE
@@ -489,10 +554,18 @@ export class KodyRulesService implements IKodyRulesService {
             const activeRulesCount = (existing.rules ?? []).filter(
                 (r) => r.status === KodyRulesStatus.ACTIVE,
             ).length;
-            await this.ensureFreePlanLimit(
+            statusOverride = await this.resolveStatusWithinPlanLimit(
                 organizationAndTeamData,
+                KodyRulesStatus.ACTIVE,
                 activeRulesCount + 1,
             );
+        } else if (
+            kodyRule.status !== undefined &&
+            kodyRule.status !== KodyRulesStatus.ACTIVE
+        ) {
+            // Any explicit non-ACTIVE transition (manual pause, reject,
+            // delete) is user-initiated, not a plan lock.
+            statusOverride = { status: kodyRule.status, lockedByPlan: false };
         }
 
         // Normalize severity on the way in (create/addRule already do this);
@@ -505,15 +578,45 @@ export class KodyRulesService implements IKodyRulesService {
         const updatedRule = {
             ...existingRule,
             ...kodyRule,
+            ...statusOverride,
             ...(mergedSeverity ? { severity: mergedSeverity } : {}),
             updatedAt: new Date(),
         };
+
+        // The spread above carries the OLD summary. If the rule text changed
+        // it is stale (would also fail the sourceHash guard at review time):
+        // drop it — this also covers a long rule edited down to a short one,
+        // which must not keep a summary of its former long text. A long new
+        // text gets a fresh summary scheduled below.
+        const ruleTextChanged =
+            kodyRule.rule !== undefined && kodyRule.rule !== existingRule.rule;
+        // Examples gate the atom detectors (atoms sourceHash covers them), so
+        // an examples-only edit invalidates the DECOMPOSITION — but not the
+        // summary, whose hash covers the rule text alone and stays valid as
+        // the fallback while fresh atoms are regenerated.
+        const examplesChanged =
+            kodyRule.examples !== undefined &&
+            JSON.stringify(kodyRule.examples) !==
+                JSON.stringify(existingRule.examples);
+        if (ruleTextChanged) {
+            delete (updatedRule as Partial<IKodyRule>).summary;
+            delete (updatedRule as Partial<IKodyRule>).atoms;
+        } else if (examplesChanged) {
+            delete (updatedRule as Partial<IKodyRule>).atoms;
+        }
 
         const updatedKodyRules = await this.updateRule(
             existing.uuid,
             kodyRule.uuid,
             updatedRule,
         );
+
+        if (updatedKodyRules && (ruleTextChanged || examplesChanged)) {
+            this.scheduleSummaryGeneration(
+                organizationAndTeamData,
+                updatedRule,
+            );
+        }
 
         this.eventEmitter.emit(AuditLogEvents.KODY_RULES, {
             organizationAndTeamData,
@@ -543,7 +646,8 @@ export class KodyRulesService implements IKodyRulesService {
         rule: Partial<IKodyRule>,
     ): Promise<void> {
         if (
-            rule.origin === KodyRulesOrigin.USER ||
+            rule.origin === KodyRulesOrigin.MANUAL ||
+            rule.origin === KodyRulesOrigin.ONBOARDING_REPO_ANALYSIS ||
             !rule.repositoryId ||
             rule.repositoryId === 'global'
         ) {
@@ -570,18 +674,6 @@ export class KodyRulesService implements IKodyRulesService {
                 organizationAndTeamData,
             );
 
-            if (!codeReviewConfig?.configValue) {
-                return;
-            }
-
-            const configValue =
-                codeReviewConfig.configValue as CodeReviewParameter;
-            const repositories = configValue.repositories || [];
-
-            if (repositories.some((r) => r.id === rule.repositoryId)) {
-                return;
-            }
-
             let repositoryName = rule.repositoryId;
             try {
                 const repos =
@@ -606,6 +698,32 @@ export class KodyRulesService implements IKodyRulesService {
                 isSelected: true,
                 configs: {},
             };
+
+            if (!codeReviewConfig?.configValue) {
+                const configValue: CodeReviewParameter = {
+                    id: 'global',
+                    name: 'Global',
+                    isSelected: true,
+                    configs: {},
+                    repositories: [newRepo],
+                };
+
+                await parametersService.createOrUpdateConfig(
+                    ParametersKey.CODE_REVIEW_CONFIG,
+                    configValue,
+                    organizationAndTeamData,
+                );
+
+                return;
+            }
+
+            const configValue =
+                codeReviewConfig.configValue as CodeReviewParameter;
+            const repositories = configValue.repositories || [];
+
+            if (repositories.some((r) => r.id === rule.repositoryId)) {
+                return;
+            }
 
             const updatedConfigValue: CodeReviewParameter = {
                 ...configValue,
@@ -702,6 +820,53 @@ export class KodyRulesService implements IKodyRulesService {
         return updatedRuleResult ? (updatedRuleResult as IKodyRule) : null;
     }
 
+    async updateRuleDetector(
+        organizationId: string,
+        ruleId: string,
+        detector: IKodyRuleDetector | null,
+    ): Promise<IKodyRule | null> {
+        const existing = await this.findByOrganizationId(organizationId);
+        if (!existing) {
+            throw new NotFoundException(
+                'Kody rules not found for organization',
+            );
+        }
+
+        const existingRule = existing.rules?.find((r) => r.uuid === ruleId);
+        if (!existingRule) {
+            throw new NotFoundException('Rule not found');
+        }
+
+        const updatedRule = {
+            ...existingRule,
+            // Pass `null` through as-is: updateRule skips only `undefined`, so
+            // `detector: null` writes `$set rules.$.detector = null` and clears
+            // a stale detector. `?? undefined` here would silently no-op the
+            // clear and leave the old regex firing forever.
+            detector: detector,
+            updatedAt: new Date(),
+        } as IKodyRule;
+
+        const updatedKodyRules = await this.updateRule(
+            existing.uuid,
+            ruleId,
+            updatedRule,
+        );
+
+        if (!updatedKodyRules) {
+            this.logger.error({
+                message: 'Could not update rule detector',
+                error: new Error('Could not update rule detector'),
+                context: KodyRulesService.name,
+                metadata: { organizationId, ruleId },
+            });
+            throw new Error('Could not update rule detector');
+        }
+
+        const updated = updatedKodyRules.rules.find((r) => r.uuid === ruleId);
+        return updated ? (updated as IKodyRule) : null;
+    }
+
     async updateRuleWithLogging(
         organizationAndTeamData: OrganizationAndTeamData,
         kodyRule: CreateKodyRuleDto,
@@ -737,11 +902,37 @@ export class KodyRulesService implements IKodyRulesService {
             updatedAt: new Date(),
         };
 
+        // Same stale-summary treatment as createOrUpdate: text changed →
+        // drop the carried-over summary and schedule a fresh one below.
+        const ruleTextChanged =
+            kodyRule.rule !== undefined && kodyRule.rule !== existingRule.rule;
+        // Examples gate the atom detectors (atoms sourceHash covers them), so
+        // an examples-only edit invalidates the DECOMPOSITION — but not the
+        // summary, whose hash covers the rule text alone and stays valid as
+        // the fallback while fresh atoms are regenerated.
+        const examplesChanged =
+            kodyRule.examples !== undefined &&
+            JSON.stringify(kodyRule.examples) !==
+                JSON.stringify(existingRule.examples);
+        if (ruleTextChanged) {
+            delete (updatedRule as Partial<IKodyRule>).summary;
+            delete (updatedRule as Partial<IKodyRule>).atoms;
+        } else if (examplesChanged) {
+            delete (updatedRule as Partial<IKodyRule>).atoms;
+        }
+
         const updatedKodyRules = await this.updateRule(
             existing.uuid,
             kodyRule.uuid,
             updatedRule,
         );
+
+        if (updatedKodyRules && (ruleTextChanged || examplesChanged)) {
+            this.scheduleSummaryGeneration(
+                organizationAndTeamData,
+                updatedRule,
+            );
+        }
 
         this.eventEmitter.emit(AuditLogEvents.KODY_RULES, {
             organizationAndTeamData,
@@ -871,34 +1062,45 @@ export class KodyRulesService implements IKodyRulesService {
         }
     }
 
-    private async ensureFreePlanLimit(
+    /**
+     * Resolves the status a rule should actually land in, given the free
+     * plan's active-rule quota. Rather than rejecting the request outright,
+     * a rule that would push the org over the quota is created/reactivated
+     * as `PAUSED` with `lockedByPlan: true` — same "value-forward" pattern
+     * as MCP plugins beyond their cap: it's created, just not enforced,
+     * and the web UI shows it as Locked with an upgrade CTA instead of
+     * making it vanish or hard-blocking the action.
+     *
+     * Only meaningful when `requestedStatus` is ACTIVE — anything else
+     * (paused/pending/rejected/deleted) never consumes quota and passes
+     * through unchanged.
+     */
+    private async resolveStatusWithinPlanLimit(
         organizationAndTeamData: OrganizationAndTeamData,
+        requestedStatus: KodyRulesStatus,
         totalRulesAfterOperation: number,
-    ) {
-        if (!organizationAndTeamData?.organizationId) {
-            return;
+    ): Promise<{ status: KodyRulesStatus; lockedByPlan: boolean }> {
+        if (
+            requestedStatus !== KodyRulesStatus.ACTIVE ||
+            !organizationAndTeamData?.organizationId
+        ) {
+            return { status: requestedStatus, lockedByPlan: false };
         }
 
         try {
-            const validation =
+            const withinLimit =
                 await this.kodyRulesValidationService.validateRulesLimit(
                     organizationAndTeamData,
                     totalRulesAfterOperation,
                 );
 
-            if (!validation) {
-                throw new BadRequestException(
-                    `Free plan's limit of Kody Rules reached.`,
-                );
+            if (withinLimit) {
+                return { status: KodyRulesStatus.ACTIVE, lockedByPlan: false };
             }
         } catch (error) {
-            if (error instanceof BadRequestException) {
-                throw error;
-            }
-
             this.logger.error({
                 message:
-                    'Error validating Kody Rules limit - blocking operation for safety',
+                    'Error validating Kody Rules limit - locking rule for safety',
                 error: error,
                 context: KodyRulesService.name,
                 metadata: {
@@ -906,11 +1108,11 @@ export class KodyRulesService implements IKodyRulesService {
                     totalRulesAfterOperation,
                 },
             });
-
-            throw new BadRequestException(
-                `Unable to validate rules limit. Please try again later.`,
-            );
+            // Fail closed: same outcome as hitting the cap, but the rule
+            // still gets created/reactivated instead of the request erroring.
         }
+
+        return { status: KodyRulesStatus.PAUSED, lockedByPlan: true };
     }
 
     private addLanguageToRule(
@@ -1042,17 +1244,6 @@ export class KodyRulesService implements IKodyRulesService {
                         }
                     }
 
-                    // Filtro por needMCPS (required_mcps)
-                    if (filters.needMCPS === true) {
-                        const hasRequiredMcps =
-                            Array.isArray(rule.required_mcps) &&
-                            rule.required_mcps.length > 0;
-
-                        if (!hasRequiredMcps) {
-                            return false;
-                        }
-                    }
-
                     return true;
                 });
             }
@@ -1151,49 +1342,6 @@ export class KodyRulesService implements IKodyRulesService {
         }
     }
 
-    async getRecommendedRulesByMCP(
-        organizationAndTeamData: OrganizationAndTeamData,
-    ): Promise<LibraryKodyRule[]> {
-        try {
-            const mcpConnections = await this.mcpManagerService.getConnections(
-                organizationAndTeamData,
-                false,
-            );
-
-            if (!mcpConnections || mcpConnections.length === 0) {
-                return [];
-            }
-
-            const installedMCPs = mcpConnections.map((conn) => conn.appName);
-
-            const eligibleRules = (
-                libraryKodyRules as LibraryKodyRule[]
-            ).filter((rule) => {
-                if (!rule.required_mcps || rule.required_mcps.length === 0) {
-                    return false;
-                }
-
-                return rule.required_mcps.some((mcp) =>
-                    installedMCPs.some((installedMCP) =>
-                        installedMCP.toLowerCase().includes(mcp.toLowerCase()),
-                    ),
-                );
-            });
-
-            return eligibleRules;
-        } catch (error) {
-            this.logger.error({
-                message: 'Error in getRecommendedRulesByMCP',
-                error: error,
-                context: KodyRulesService.name,
-                metadata: {
-                    organizationId: organizationAndTeamData.organizationId,
-                },
-            });
-            return [];
-        }
-    }
-
     async getRecommendedRulesBySuggestions(
         organizationAndTeamData: OrganizationAndTeamData,
         repositoryId: string,
@@ -1274,16 +1422,7 @@ export class KodyRulesService implements IKodyRulesService {
                     organizationAndTeamData,
                 );
 
-            const mainProvider = LLMModelProvider.GROQ_MOONSHOTAI_KIMI_K2_;
-            const mainFallback = LLMModelProvider.GROQ_GPT_OSS_120B;
             const mainRun = 'kodyRulesRecommendationFromSuggestions';
-
-            const promptRunner = new BYOKPromptRunnerService(
-                this.promptRunnerService,
-                mainProvider,
-                mainFallback,
-                byokConfigValue,
-            );
 
             const systemPrompt = `You are a code quality expert analyzing past code review suggestions to recommend relevant Kody Rules.
 
@@ -1326,48 +1465,19 @@ ${JSON.stringify(filteredLibrary)}
 
 Analyze the suggestions and recommend the most relevant rules.`;
 
-            const { result } = await this.observabilityService.runLLMInSpan({
-                spanName: `${KodyRulesService.name}::${mainRun}`,
-                runName: mainRun,
+            const result = await runStructuredReviewCall({
+                byokConfig: byokConfigValue ?? undefined,
+                schema: kodyRulesRecommendationSchema,
+                system: systemPrompt,
+                user: userPrompt,
+                runName: `${KodyRulesService.name}::${mainRun}`,
+                organizationId: organizationAndTeamData.organizationId,
                 attrs: {
                     repositoryId,
-                    organizationId: organizationAndTeamData.organizationId,
                     suggestionsCount: allSuggestions.length,
                     libraryRulesCount: filteredLibrary.length,
-                    type: promptRunner.executeMode,
                 },
-                byokConfig: byokConfigValue,
-                exec: async (callbacks) => {
-                    return await promptRunner
-                        .builder()
-                        .setParser(
-                            ParserType.ZOD,
-                            kodyRulesRecommendationSchema,
-                            {
-                                provider: LLMModelProvider.GEMINI_2_5_FLASH,
-                                fallbackProvider:
-                                    LLMModelProvider.OPENAI_GPT_4O,
-                            },
-                        )
-                        .setLLMJsonMode(true)
-                        .setPayload({
-                            repositoryId,
-                            organizationId:
-                                organizationAndTeamData.organizationId,
-                        })
-                        .addPrompt({
-                            role: PromptRole.SYSTEM,
-                            prompt: systemPrompt,
-                        })
-                        .addPrompt({
-                            role: PromptRole.USER,
-                            prompt: userPrompt,
-                        })
-                        .addCallbacks(callbacks)
-                        .addMetadata({ runName: mainRun })
-                        .setRunName(mainRun)
-                        .execute();
-                },
+                observabilityService: this.observabilityService,
             });
 
             if (
@@ -1830,13 +1940,6 @@ Analyze the suggestions and recommend the most relevant rules.`;
             );
         const runName = 'kodyMemoryResolution';
 
-        const promptRunner = new BYOKPromptRunnerService(
-            this.promptRunnerService,
-            LLMModelProvider.GROQ_MOONSHOTAI_KIMI_K2_,
-            LLMModelProvider.GROQ_GPT_OSS_120B,
-            byokConfigValue,
-        );
-
         const incomingMemory = {
             title: memory.title,
             rule: memory.rule,
@@ -1854,41 +1957,20 @@ Analyze the suggestions and recommend the most relevant rules.`;
             path: existingMemory.path,
         }));
 
-        const { result } = await this.observabilityService.runLLMInSpan({
-            spanName: `${KodyRulesService.name}::${runName}`,
+        const result = await runStructuredReviewCall({
+            byokConfig: byokConfigValue ?? undefined,
+            schema: kodyMemoryResolutionSchema,
+            system: prompt_kodyMemoryResolution_system(),
+            user: prompt_kodyMemoryResolution_user({
+                incomingMemory,
+                existingMemories: existingForPrompt,
+            }),
             runName,
+            organizationId: organizationAndTeamData.organizationId,
             attrs: {
-                organizationId: organizationAndTeamData.organizationId,
                 existingMemoriesCount: existingMemories.length,
-                type: promptRunner.executeMode,
             },
-            byokConfig: byokConfigValue,
-            exec: async (callbacks) => {
-                return await promptRunner
-                    .builder()
-                    .setParser(ParserType.ZOD, kodyMemoryResolutionSchema, {
-                        provider: LLMModelProvider.GEMINI_2_5_FLASH,
-                        fallbackProvider: LLMModelProvider.OPENAI_GPT_4O,
-                    })
-                    .setLLMJsonMode(true)
-                    .setPayload({
-                        organizationId: organizationAndTeamData.organizationId,
-                        incomingMemory,
-                        existingMemories: existingForPrompt,
-                    })
-                    .addPrompt({
-                        role: PromptRole.SYSTEM,
-                        prompt: prompt_kodyMemoryResolution_system,
-                    })
-                    .addPrompt({
-                        role: PromptRole.USER,
-                        prompt: prompt_kodyMemoryResolution_user,
-                    })
-                    .addCallbacks(callbacks)
-                    .addMetadata({ runName })
-                    .setRunName(runName)
-                    .execute();
-            },
+            observabilityService: this.observabilityService,
         });
 
         return result;

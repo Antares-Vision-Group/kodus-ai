@@ -161,6 +161,14 @@ function buildOpenAICompatibleConfig(config, apiKey, defaultName) {
 }
 
 async function createModel(config) {
+    if (config.provider === 'tier0') {
+        const modelId = process.env.RECALL_MODEL || config.model;
+        const { applyModelEnv } = require('../shared/tier0-models');
+        const { byokToVercelModel } = require('../../libs/llm/byok-to-vercel.ts');
+        applyModelEnv(modelId);
+        return byokToVercelModel(undefined, 'main', {});
+    }
+
     // Env overrides so ANY model runs from one yaml (no per-provider config):
     //   RECALL_MODEL, RECALL_PROVIDER, RECALL_BASEURL, RECALL_APIKEY_ENV.
     if (process.env.RECALL_PROVIDER || process.env.RECALL_BASEURL) {
@@ -410,7 +418,7 @@ function buildCurrentPrompts(caseData) {
     const { GeneralistAgentProvider } = require(
         path.join(
             __dirname,
-            '../../libs/code-review/infrastructure/agents/generalist-agent.provider.ts',
+            '../../libs/code-review/infrastructure/agents/providers/generalist-agent.provider.ts',
         ),
     );
 
@@ -473,6 +481,39 @@ function serializeResult(caseId, agentResult, remoteCommands) {
     };
 }
 
+function agentRunFailure(agentResult) {
+    if (!agentResult || typeof agentResult !== 'object') {
+        return 'agent loop returned no result';
+    }
+
+    const finishReason = agentResult.finishReason || 'unknown';
+    const usage = agentResult.usage || {};
+    const totalTokens = Number(usage.totalTokens || 0);
+    const steps = Number(agentResult.steps || 0);
+    const trace = Array.isArray(agentResult.debugTrace)
+        ? agentResult.debugTrace
+        : [];
+    const errorEvent = [...trace]
+        .reverse()
+        .find((event) => event && event.kind === 'error');
+    const errorMessage =
+        errorEvent?.detail && typeof errorEvent.detail.message === 'string'
+            ? errorEvent.detail.message
+            : '';
+
+    if (finishReason === 'error') {
+        return errorMessage
+            ? `agent loop finished with error: ${errorMessage}`
+            : 'agent loop finished with error';
+    }
+
+    if (steps === 0 && totalTokens === 0) {
+        return 'agent loop produced zero steps and zero tokens';
+    }
+
+    return null;
+}
+
 function writeResultArtifact(filename, payload) {
     try {
         fs.writeFileSync(
@@ -513,10 +554,15 @@ class InvestigationAgentProvider {
             }
 
             stage = 'load-agent-loop';
-            const { runAgentLoop } = require(
+            // The legacy runAgentLoop (agent-loop.ts) was deleted in the
+            // agent-harness refactor. runAgentLoopViaCore is the drop-in seam:
+            // same (input, secrets) signature, threads secrets.remoteCommands
+            // into buildFinderToolRegistry for deterministic tool replay, and
+            // runs the finder+verify on the new harness.
+            const { runAgentLoopViaCore: runAgentLoop } = require(
                 path.join(
                     __dirname,
-                    '../../libs/code-review/infrastructure/agents/llm/agent-loop.ts',
+                    '../../libs/code-review/infrastructure/agents/core/core-agent-loop.adapter.ts',
                 ),
             );
 
@@ -555,6 +601,15 @@ class InvestigationAgentProvider {
                     byokErrorReporter: undefined,
                 },
             );
+
+            const failure = agentRunFailure(agentResult);
+            if (failure) {
+                throw new Error(
+                    `${failure} (finishReason=${agentResult?.finishReason || 'unknown'}, ` +
+                        `steps=${agentResult?.steps ?? 'n/a'}, ` +
+                        `tokens=${agentResult?.usage?.totalTokens ?? 'n/a'})`,
+                );
+            }
 
             stage = 'serialize-result';
             const output = serializeResult(

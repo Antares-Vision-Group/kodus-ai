@@ -44,6 +44,7 @@
                                 "group": "AI Code Review",
                                 "pages": [
                                     "how_to_use/en/code_review/flow",
+                                    "how_to_use/en/code_review/review_directive",
                                     "how_to_use/en/code_review/policy",
                                     {
                                         "group": "Advanced Configs",
@@ -65,6 +66,7 @@
                                             "how_to_use/en/code_review/configs/rules_inheritance",
                                             "how_to_use/en/code_review/configs/rules_file_detection",
                                             "how_to_use/en/code_review/configs/repository_rules",
+                                            "how_to_use/en/code_review/configs/global_rule_sources",
                                             "how_to_use/en/code_review/learning/kody_rules_generation"
                                         ]
                                     },
@@ -168,6 +170,12 @@
                                     "how_to_deploy/en/deploy_kodus/telemetry",
                                     "how_to_deploy/en/deploy_kodus/troubleshooting",
                                     "how_to_deploy/en/deploy_kodus/updating"
+                                ]
+                            },
+                            {
+                                "group": "Deploy with Kubernetes",
+                                "pages": [
+                                    "how_to_deploy/en/deploy_kodus/kubernetes"
                                 ]
                             },
                             {
@@ -345,6 +353,7 @@
                                 "group": "Revisión de Código con IA",
                                 "pages": [
                                     "how_to_use/es/code_review/flow",
+                                    "how_to_use/es/code_review/review_directive",
                                     "how_to_use/es/code_review/policy",
                                     {
                                         "group": "Configuraciones Avanzadas",
@@ -469,6 +478,12 @@
                                     "how_to_deploy/es/deploy_kodus/telemetry",
                                     "how_to_deploy/es/deploy_kodus/troubleshooting",
                                     "how_to_deploy/es/deploy_kodus/updating"
+                                ]
+                            },
+                            {
+                                "group": "Desplegar con Kubernetes",
+                                "pages": [
+                                    "how_to_deploy/es/deploy_kodus/kubernetes"
                                 ]
                             },
                             {
@@ -646,6 +661,7 @@
                                 "group": "Revisão de Código com IA",
                                 "pages": [
                                     "how_to_use/pt-br/code_review/flow",
+                                    "how_to_use/pt-br/code_review/review_directive",
                                     "how_to_use/pt-br/code_review/policy",
                                     {
                                         "group": "Configurações Avançadas",
@@ -770,6 +786,12 @@
                                     "how_to_deploy/pt-br/deploy_kodus/telemetry",
                                     "how_to_deploy/pt-br/deploy_kodus/troubleshooting",
                                     "how_to_deploy/pt-br/deploy_kodus/updating"
+                                ]
+                            },
+                            {
+                                "group": "Implantar com Kubernetes",
+                                "pages": [
+                                    "how_to_deploy/pt-br/deploy_kodus/kubernetes"
                                 ]
                             },
                             {
@@ -947,6 +969,7 @@
                                 "group": "AIコードレビュー",
                                 "pages": [
                                     "how_to_use/ja/code_review/flow",
+                                    "how_to_use/ja/code_review/review_directive",
                                     "how_to_use/ja/code_review/policy",
                                     {
                                         "group": "詳細設定",
@@ -1071,6 +1094,12 @@
                                     "how_to_deploy/ja/deploy_kodus/telemetry",
                                     "how_to_deploy/ja/deploy_kodus/troubleshooting",
                                     "how_to_deploy/ja/deploy_kodus/updating"
+                                ]
+                            },
+                            {
+                                "group": "Kubernetes でデプロイ",
+                                "pages": [
+                                    "how_to_deploy/ja/deploy_kodus/kubernetes"
                                 ]
                             },
                             {
@@ -1248,6 +1277,7 @@
                                 "group": "AI 代码审查",
                                 "pages": [
                                     "how_to_use/zh/code_review/flow",
+                                    "how_to_use/zh/code_review/review_directive",
                                     "how_to_use/zh/code_review/policy",
                                     {
                                         "group": "高级配置",
@@ -1372,6 +1402,12 @@
                                     "how_to_deploy/zh/deploy_kodus/telemetry",
                                     "how_to_deploy/zh/deploy_kodus/troubleshooting",
                                     "how_to_deploy/zh/deploy_kodus/updating"
+                                ]
+                            },
+                            {
+                                "group": "使用 Kubernetes 部署",
+                                "pages": [
+                                    "how_to_deploy/zh/deploy_kodus/kubernetes"
                                 ]
                             },
                             {

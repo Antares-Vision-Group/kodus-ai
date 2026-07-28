@@ -3,7 +3,7 @@ import {
     BYOKProvider,
 } from '@kodus/kodus-common/llm';
 import { ProviderService } from '@libs/core/infrastructure/services/providers/provider.service';
-import { createLogger } from '@kodus/flow';
+import { createLogger } from '@libs/core/log/logger';
 import { BadRequestException, Injectable } from '@nestjs/common';
 import axios, { AxiosError } from 'axios';
 import { lookup } from 'dns/promises';
@@ -37,7 +37,9 @@ function assertSafeRegion(region: string): void {
  * axios.get — acceptable for a one-shot test probe that doesn't leak
  * response bodies back to the user.
  */
-async function assertSafeOpenAICompatibleUrl(rawUrl: string): Promise<void> {
+export async function assertSafeOpenAICompatibleUrl(
+    rawUrl: string,
+): Promise<void> {
     let parsed: URL;
     try {
         parsed = new URL(rawUrl);
